@@ -973,7 +973,7 @@ local function restorePrompts(saved)
 	for p in pairs(saved) do
 		local rec = IsolatedPrompts[p]
 		if rec then
-			rec.n -= 1
+			rec.n = rec.n - 1
 			if rec.n <= 0 then
 				IsolatedPrompts[p] = nil
 				if p.Parent and p.MaxActivationDistance == 0 then
@@ -3565,22 +3565,7 @@ do
 	_qp.Position = UDim2.new(0.5, -22, 0.5, -22)
 	_qp.BackgroundColor3 = UITheme.panel
 	_qp.BackgroundTransparency = 0.10
-	-- Ikon bebek: diunduh sekali dari GitHub ke file lokal -> getcustomasset. Tanpa base64 di source
-	-- (baris super panjang bikin parser executor mobile mati). Fallback ke ikon lama.
 	_qp.Image = "rbxassetid://126288919846878"
-	task.spawn(function()
-		pcall(function()
-			local path = "PasarHutan_Duck.png"
-			if not (isfile and isfile(path)) then
-				writefile(path, game:HttpGet("https://raw.githubusercontent.com/josephmolanaa/onimusha/main/duck.png"))
-			end
-			local id = (getcustomasset or getsynasset)(path)
-			if id and id ~= "" then
-				_qp.Image = id
-				_qp.ResampleMode = Enum.ResamplerMode.Pixelated
-			end
-		end)
-	end)
 	_qp.ScaleType = Enum.ScaleType.Fit
 	_qp.AutoButtonColor = false
 	_qp.BorderSizePixel = 0
@@ -4618,7 +4603,7 @@ task.spawn(function()
 			if b then seenAt[b] = nil end
 			return false
 		end
-		local now = os.clock()
+		local now = tick()
 		if not seenAt[b] then
 			seenAt[b] = now + 0.6 + math.random() * 0.8 -- waktu reaksi + tunggu animasi masuk
 			return false

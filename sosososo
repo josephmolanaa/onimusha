@@ -3565,30 +3565,21 @@ do
 	_qp.Position = UDim2.new(0.5, -22, 0.5, -22)
 	_qp.BackgroundColor3 = UITheme.panel
 	_qp.BackgroundTransparency = 0.10
-	-- Ikon bebek (frame 1 sprite, PNG transparan) ditanam base64 -> file lokal -> getcustomasset.
-	-- Fallback ke ikon lama kalau executor tidak punya writefile/getcustomasset.
+	-- Ikon bebek: diunduh sekali dari GitHub ke file lokal -> getcustomasset. Tanpa base64 di source
+	-- (baris super panjang bikin parser executor mobile mati). Fallback ke ikon lama.
 	_qp.Image = "rbxassetid://126288919846878"
-	pcall(function()
-		local path = "PasarHutan_Duck.png"
-		if not (isfile and isfile(path)) then
-			local b64 = "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"
-			local map, out = {}, {}
-			local abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-			for i = 1, 64 do map[abc:byte(i)] = i - 1 end
-			for i = 1, #b64, 4 do
-				local a, b, c, d = map[b64:byte(i)], map[b64:byte(i + 1)], map[b64:byte(i + 2)], map[b64:byte(i + 3)]
-				local n = a * 262144 + b * 4096 + (c or 0) * 64 + (d or 0)
-				out[#out + 1] = string.char(math.floor(n / 65536))
-				if c then out[#out + 1] = string.char(math.floor(n / 256) % 256) end
-				if d then out[#out + 1] = string.char(n % 256) end
+	task.spawn(function()
+		pcall(function()
+			local path = "PasarHutan_Duck.png"
+			if not (isfile and isfile(path)) then
+				writefile(path, game:HttpGet("https://raw.githubusercontent.com/josephmolanaa/onimusha/main/duck.png"))
 			end
-			writefile(path, table.concat(out))
-		end
-		local id = (getcustomasset or getsynasset)(path)
-		if id and id ~= "" then
-			_qp.Image = id
-			_qp.ResampleMode = Enum.ResamplerMode.Pixelated
-		end
+			local id = (getcustomasset or getsynasset)(path)
+			if id and id ~= "" then
+				_qp.Image = id
+				_qp.ResampleMode = Enum.ResamplerMode.Pixelated
+			end
+		end)
 	end)
 	_qp.ScaleType = Enum.ScaleType.Fit
 	_qp.AutoButtonColor = false

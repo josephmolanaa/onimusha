@@ -908,29 +908,107 @@ local function smoothMoveTo(_fe, _ff, _fg)
 	end
 	return true
 end
+-- Posisi dunia sebuah prompt (parent BasePart / Attachment / Model)
+local function promptWorldPos(p)
+	local par = p and p.Parent
+	if not par then return nil end
+	if par:IsA("Attachment") then return par.WorldPosition end
+	if par:IsA("BasePart") then return par.Position end
+	if par:IsA("Model") then return par:GetPivot().Position end
+	return nil
+end
+
+-- Prompt berdekatan (gosok/ambil/palung babi) sering "tabrakan": E / hold kena prompt lain.
+-- Selama interaksi, prompt lain dalam radius dimatikan LOKAL lewat MaxActivationDistance=0
+-- (bukan Enabled, supaya tidak melawan toggle dari server), lalu dikembalikan.
+local PROMPT_ISOLATE_RADIUS = 14
+-- Registry global: prompt -> jarak asli. Dipakai bersama (refcount) & dipulihkan saat script di-reload,
+-- supaya prompt tidak pernah "nyangkut" mati kalau run sebelumnya crash di tengah hold.
+local IsolatedPrompts = getgenv().PH_IsolatedPrompts or {}
+getgenv().PH_IsolatedPrompts = IsolatedPrompts
+for p, rec in pairs(IsolatedPrompts) do
+	pcall(function() p.MaxActivationDistance = rec.dist end)
+	IsolatedPrompts[p] = nil
+end
+local function isolatePrompt(target)
+	local pos = promptWorldPos(target)
+	local saved = {}
+	if not pos then return saved end
+	local function take(d)
+		if d == target or saved[d] or not d:IsA("ProximityPrompt") then return end
+		local dp = promptWorldPos(d)
+		if not dp or (dp - pos).Magnitude > PROMPT_ISOLATE_RADIUS then return end
+		local rec = IsolatedPrompts[d]
+		if rec then
+			rec.n += 1
+		elseif d.MaxActivationDistance > 0 then
+			IsolatedPrompts[d] = { dist = d.MaxActivationDistance, n = 1 }
+			d.MaxActivationDistance = 0
+		else
+			return
+		end
+		saved[d] = true
+	end
+	-- 1) Satu kandang/model yang sama (lengkap, termasuk prompt di Model & part CanQuery=false)
+	local root = target.Parent
+	while root and root.Parent ~= workspace and not root.Name:find("^Kandang") do
+		root = root.Parent
+	end
+	if root and root ~= workspace then
+		for _, d in ipairs(root:GetDescendants()) do take(d) end
+	end
+	-- 2) Tetangga di luar kandang (babi yang jalan-jalan, palung, dll)
+	local ok, parts = pcall(workspace.GetPartBoundsInRadius, workspace, pos, PROMPT_ISOLATE_RADIUS)
+	if ok then
+		for _, part in ipairs(parts) do
+			local m = part.Parent
+			for _, d in ipairs((m and m ~= workspace and m:IsA("Model") and m or part):GetDescendants()) do
+				take(d)
+			end
+		end
+	end
+	return saved
+end
+local function restorePrompts(saved)
+	for p in pairs(saved) do
+		local rec = IsolatedPrompts[p]
+		if rec then
+			rec.n -= 1
+			if rec.n <= 0 then
+				IsolatedPrompts[p] = nil
+				if p.Parent and p.MaxActivationDistance == 0 then
+					p.MaxActivationDistance = rec.dist
+				end
+			end
+		end
+	end
+end
+
 local function fireProximityPromptSafe(_fn, _fo)
 	if not (_fn and _fn.Parent and _fn.Enabled) then
 		return
 	end
-	local _fp = _fo or _fn.HoldDuration or PromptDefaultHold
-	if PromptInteractMode == "fire" and fireproximityprompt then
-		pcall(fireproximityprompt, _fn, _fp + 0.1)
-		task.wait(0.2)
-	elseif PromptInteractMode == "vim" then
-		pcall(function()
+	local _fp = (_fo or _fn.HoldDuration or PromptDefaultHold) + math.random() * 0.15
+	local saved = {}
+	pcall(function() saved = isolatePrompt(_fn) end)
+	-- pcall: apa pun yang error di tengah hold, prompt lain tetap dipulihkan di bawah
+	pcall(function()
+		task.wait(0.08 + math.random() * 0.12) -- beri waktu UI prompt pindah ke target
+		if PromptInteractMode == "fire" and fireproximityprompt then
+			fireproximityprompt(_fn, _fp + 0.1)
+			task.wait(0.2)
+		elseif PromptInteractMode == "vim" then
 			VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-		end)
-		task.wait(_fp + 0.05)
-		pcall(function()
+			task.wait(_fp + 0.05)
 			VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-		end)
-	else
-		pcall(function()
+		else
 			_fn:InputHoldBegin()
 			task.wait(_fp + 0.05)
 			_fn:InputHoldEnd()
-		end)
-	end
+		end
+	end)
+	restorePrompts(saved)
+	task.wait(0.15 + math.random() * 0.2) -- jeda manusiawi antar interaksi, anti-spam
 end
 local function getMyPlotAndFarm()
 	local _fr = workspace:FindFirstChild("Plot") or workspace:FindFirstChild("Plots")
@@ -3480,8 +3558,32 @@ do
 	_qp.Position = UDim2.new(0.5, -22, 0.5, -22)
 	_qp.BackgroundColor3 = UITheme.panel
 	_qp.BackgroundTransparency = 0.10
+	-- Ikon bebek (frame 1 sprite, PNG transparan) ditanam base64 -> file lokal -> getcustomasset.
+	-- Fallback ke ikon lama kalau executor tidak punya writefile/getcustomasset.
 	_qp.Image = "rbxassetid://126288919846878"
-	_qp.ScaleType = Enum.ScaleType.Crop
+	pcall(function()
+		local path = "PasarHutan_Duck.png"
+		if not (isfile and isfile(path)) then
+			local b64 = "iVBORw0KGgoAAAANSUhEUgAAAOAAAADgCAYAAAAaLWrhAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAA7NSURBVHhe7ZsxkmS3EQV5CdHRBeTIp63YG+louobOQZeWDInGyikjjQSjC6zGNua/jEjzo4FXr6yJ+Sn8WH75+e/ff6R1jRCeiS3FSesaITwTW4qT1jVCeCa2FCeta4TwTGwpTlrXCOGZ2FKctK4RwjOxpThpXSOEZ2JLcdK6RgjPxJaC/vbt25/SzqR1jRCeiS0FtaXqaGfSukYIz8SWgtpSdbQzaV0jhGdiS0FtqTrambSuEcIzsaWgtlQd7Uxa1wjhmdhSUFuqjnYmrWuE8ExsKagtVUc7k9Y1QngmthTUlqqjnUnrGiE8E1sKakvV0c6kdY0QnoktBbWl6mhn0rpGCM/EloLaUnW0M2ldI4RnYktBbak62pm0rhHCM7GloLZUHe1MWtcI4ZnYUlBbqo52Jq1rhPBMbCmoLVVHO5PWNUJ4JrYU1Jaqo51J6xohPBNbCmpL1dHOpHWNEJ6JLQW1pepoZ9K6RgjPxJaC2lJ1tDNpXSOEZ2JLQW2pOtqZtK4RwjOxpaC2VB3tTFrXCOGZ2FJQW6qOdiata4TwTGwpqC1VRzuT1jVCeCa2FNSWqqOdSesaITwTW4qT1jVCeCa2FCeta4TwTGwpTlrXCOGZ2FKctK4RwjOxpThpXSOEZ2JLcdK6RgjPxJbipHWNEJ6JLcVJ6xohBMP+uN6xjgkh7GBL1bGOCSHsYEvVsY4JIexgS9Wxjgkh7GBL1bGOCSHsYEvVsY4JIexgS9Wxjgkh7GBL1bGOCSHsYEvVsY4JIexgS9Wxjgkh7GBL1bGOCSHsYEvVsY4JIexgS9Wxjgkh7GBL1bGOCSHsYEvVsY4JIexgS9Wxjgnha2L/5HqT9YwQ7sRKfZP1jBDuxEp9k/WMEO7ESn2T9YwQ7sRKfZP1jBDuxEp9k/WMEO7ESn2T9YwQ7sRKfZP1jBB+DFbKjv/7919+qN9///VPaW/qWDGGsIeVqqMtxUltqTramzpWjCHsYaXqaEtxUluqjvamjhVjCHtYqTraUpzUlqqjvaljxRjCHlaqjrYUJ7Wl6mhv6lgxhrCHlaqjLcVJbak62ps6Vowh7GGl6mhLcVJbqo72po4VYwh7WKk62lKc1Jaqo72pY8UYgmOloVbqr6Qt3aSWKa0xhKdipaBW2q+kLc2klimtMYSnYqWgVtqvpC3NpJYprTGEp2KloFbar6QtzaSWKa0xhKdipaBW2q+kLc2klimtMYSnYqWgVtqvpC3NpJYprTGEp2KloFbar6QtzaSWKa0xhKdipaBW2q+kLc2klimtMYSvig2d/vefP/+hVto4p82E1hjDrdhQqS0dtdLEOW0mtMYYbsWGSm3pqJUmzmkzoTXGcCs2VGpLR600cU6bCa0xhluxoVJbOmqliXPaTGiNMdyKDZXa0lErTZzTZkJrjOFWbKjUlo5aaeKcNhNaYwy3YkOltnTUShPntJnQGmN4F1b6SW2o1L6hVppJ7U60Ylpi31D7zU/SMp+0YgorLLRJrZTUvqFWmkntTrRiWmLfUPvNT9Iyn7RiCisstEmtlNS+oVaaSe1OtGJaYt9Q+81P0jKftGIKKyy0Sa2U1L6hVppJ7U60Ylpi31D7zU/SMp+0YgorLLRJrZTUvqFWmkntTrRiWmLfUPvNT9Iyn7RiCisstEmtlNS+oVaaSe1OtGJaYt9Q+81P0jKftGIKKyy0Sa2U1L6hVppJ7U60Ylpi31D7zU/SMp+0YgorLLRJrZTUvqFWmkntTrRiWmLfUPvNT9Iyn7RiCisstEmtlNS+oVaak9qdacW4xM6c1O7U0TKftGIIKyy0SW3o1L6hVrqT2p1pxbjEzpzU7tTRMp+0YggrLLRJbejUvqFWupPanWnFuMTOnNTu1NEyn7RiCCsstElt6NS+oVa6k9qdacW4xM6c1O7U0TKftGIIKyy0SW3o1L6hVrqT2p1pxbjEzpzU7tTRMp+0YggrLLRJbejUvqFWupPanWnFuMTOnNTu1NEyn7RiCCsstElt6NS+oVa6k9qdacW4xM6c1O7U0TKftGIIKyy0SW3o1L6hVrqT2p1pxbjEzpzU7tTRMp+0YggrLLRJbejUvqFWukntTrRiWmLfUPtNat/Q//zjb2/VMp+0YgorLLRJrVTUvqFW2kntTrRiWmLfUPtNat9QW5pJLfNJK6awwkKb1EpF7RtqpZ3U7kQrpiX2DbXfpPYNtaWZ1DKftGIKKyy0Sa1U1L6hVtpJ7U60Ylpi31D7TWrfUFuaSS3zSSumsMJCm9RKRe0baqWd1O5EK6Yl9g2136T2DbWlmdQyn7RiCisstEmtVNS+oVbaSe1OtGJaYt9Q+01q31Bbmkkt80krprDCQpvUSkXtG2qlndTuRCumJfYNtd+k9g21pZnUMp+0YgorLLRJrVTUvqFW2kntTrRiWmLfUPtNat9QW5pJLfNJK6awwkKb1ErV0c6kVuqbtDef1DKdtGoWVlhok9rQO9qZ1Ep9k/bmk1qmk1bNwgoLbVIbekc7k1qpb9LefFLLdNKqWVhhoU1qQ+9oZ1Ir9U3am09qmU5aNQsrLLRJbegd7Uxqpb5Je/NJLdNJq2ZhhYU2qQ29o51JrdQ3aW8+qWU6adUsrLDQJrWhd7QzqZX6Ju3NJ7VMJ62ahRUW2qQ29I52JrVS36S9+aSW6aRVs7DCQpvUSketFB3tN2/S3kT/9ddf3qrdadKqWVhhoU1qS0etdB3tN2/S3kRtaSa1O01aNQsrLLRJbemola6j/eZN2puoLc2kdqdJq2ZhhYU2qS0dtdJ1tN+8SXsTtaWZ1O40adUsrLDQJrWlo1a6jvabN2lvorY0k9qdJq2ahRUW2qS2dNRK19F+8ybtTdSWZlK706RVs7DCQpvUlo5a6Trab96kvYna0kxqd5q0ahZWWGiT2tJRK11H+82btDdRW5pJ7U6TVs3CCgttUlu6+Lq2lJPazCatmoUVFtqkVqr4urY0k9rMJq2ahRUW2qRWqvi6tjST2swmrZqFFRbapFaq+Lq2NJPazCatmoUVFtqkVqr4urY0k9rMJq2ahRUW2qRWqvi6tjST2swmrZqFFRbapFaq+Lq2NJPazCatmoUVFtqkVqr4urY0k9rMJq2ahV1saNRK09HOvEl700m///7rW7XfpJYJrRqFXSxUakPpaGfepL3ppLY0k9pvUsuEVo3CLhYqtaF0tDNv0t50UluaSe03qWVCq0ZhFwuV2lA62pk3aW86qS3NpPab1DKhVaOwi4VKbSgd7cybtDed1JZmUvtNapnQqlHYxUKlNpSOduZN2ptOakszqf0mtUxo1SjsYqFSG0pHO/Mm7U0ntaWZ1H6TWia0ahR2sVCpDaWjnXmT9qaT2tJMar9JLRNaNQq7WKjUhkLtG2p/vKVWik/S3kTtTdQy62h3ovbNpPZmWjUKu1io1IZC7RtqpaRWqk/S3kTtTdQy62h3ovbNpPZmWjUKu1io1IZC7RtqpaRWqk/S3kTtTdQy62h3ovbNpPZmWjUKu1io1IZC7RtqpaRWqk/S3kTtTdQy62h3ovbNpPZmWjUKu1io1IZC7RtqpaRWqk/S3kTtTdQy62h3ovbNpPZmWjUKu1io1IZC7RtqpaRWqk/S3kTtTdQy62h3ovbNpPZmWjUKu1io1IZC7RtqpaRWqk/S3kTtTdQy62h3ovbNpPZmWjUKu1io1IZC7RtqpaRWqk/S3kTtTdQy62h3ovbNpPZmWjUKu1io1IZC7RtqpaR2JrXSdbQzO9qbqL2J2pk3aW+mVaOwi4VKbSjUvqFWSmpnUluqjnZmR3sTtTdRO/Mm7c20ahR2sVCpDYXaN9RKSe1MakvV0c7saG+i9iZqZ96kvZlWjcIuFiq1oVD7hlopqZ1Jbak62pkd7U3U3kTtzJu0N9OqUdjFQqU2FGrfUCsltTOpLVVHO7OjvYnam6ideZP2Zlo1CrtYqNSGQu0baqWkdia1pepoZ3a0N1F7E7Uzb9LeTKtGYRcLldpQqH1DrZTUzqS2VB3tzI72JmpvonbmTdqbadUo7GKhUhsKtW+olZLamdSWqqOd2dHeRO1N1M68SXszrRqFXSxUakOhv3379odaKTvab57UMqF2Z2pn3qS9mVaNwi4WKrWhUFs6aqXsaL95UsuE2p2pnXmT9mZaNQq7WKjUhkJt6aiVsqP95kktE2p3pnbmTdqbadUo7GKhUhsKtaWjVsqO9psntUyo3ZnamTdpb6ZVo7CLhUptKNSWjlopO9pvntQyoXZnamfepL2ZVo3CLhYqtaFQWzpqpexov3lSy4TanamdeZP2Zlo1CrtYqNSGQm3pqJWyo/3mSS0TanemduZN2ptp1SjsYqFSGwq1paNWyo72mye1TKjdmdqZN2lvplWj8C4sdGpL19FKS60UcU6bCbWZ06pJeBcWOrWhdbSlo1aaOKfNhNrMadUkvAsLndrQOtrSUStNnNNmQm3mtGoS3oWFTm1oHW3pqJUmzmkzoTZzWjUJ78JCpza0jrZ01EoT57SZUJs5rZqEd2GhUxtaR1s6aqWJc9pMqM2cVk3Cu7DQqQ2toy0dtdLEOW0m1GZOqybhXVjo1IbW0ZaOWmninDYTajOnVZPwLiz0jjbUjraU8XUt0442U1o1Ce/CQu9oQ+1opYqva5l2tJnSqkl4FxZ6RxtqRytVfF3LtKPNlFZNwruw0DvaUDtaqeLrWqYdbaa0ahLehYXe0Yba0UoVX9cy7WgzpVWT8C4s9I421I5Wqvi6lmlHmymtmoR3YaF3tKF2tFLF17VMO9pMadUkvAsLvaMNtaOVKr6uZdrRZkqrJuFHYUPpaEOP57SZ0Bpz+FRsaB2tFPGcNhNaYw6fig2to5UintNmQmvM4VOxoXW0UsRz2kxojTl8Kja0jlaKeE6bCa0xh0/FhtbRShHPaTOhNebwqdjQOlop4jltJrTGHD4VG1pHK0U8p82E1phDCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQQgghhBBCCCGEEEIIIYQQFvz00/8BD0oujV2gsA0AAAAASUVORK5CYII="
+			local map, out = {}, {}
+			local abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+			for i = 1, 64 do map[abc:byte(i)] = i - 1 end
+			for i = 1, #b64, 4 do
+				local a, b, c, d = map[b64:byte(i)], map[b64:byte(i + 1)], map[b64:byte(i + 2)], map[b64:byte(i + 3)]
+				local n = a * 262144 + b * 4096 + (c or 0) * 64 + (d or 0)
+				out[#out + 1] = string.char(n // 65536)
+				if c then out[#out + 1] = string.char(n // 256 % 256) end
+				if d then out[#out + 1] = string.char(n % 256) end
+			end
+			writefile(path, table.concat(out))
+		end
+		local id = (getcustomasset or getsynasset)(path)
+		if id and id ~= "" then
+			_qp.Image = id
+			_qp.ResampleMode = Enum.ResamplerMode.Pixelated
+		end
+	end)
+	_qp.ScaleType = Enum.ScaleType.Fit
 	_qp.AutoButtonColor = false
 	_qp.BorderSizePixel = 0
 	_qp.Parent = _qo
@@ -3925,7 +4027,7 @@ local function harvestAllPlantsNow()
 	_ry = true
 	for _rC, _rD in ipairs(_rB.Tanaman:GetChildren()) do
 		requestHarvestPlant(_rD)
-		task.wait(0.1)
+		task.wait(0.25 + math.random() * 0.2)
 	end
 	_ry = false
 end
@@ -4360,6 +4462,7 @@ getgenv().AutoMinumWijayaActive = false
 					or getgenv().PH_PetirDanger and "Menghindari petir"
 					or getgenv().PH_LeburBusy and "Mengurus tungku"
 					or getgenv().PH_KandangBusy and "Mengurus kandang"
+					or SmartUI.supplyInfo
 					or getgenv().BatuFarmActive and "Mining batu"
 					or "Menunggu tugas"
 				SmartUI.title.Text = now
@@ -4497,27 +4600,51 @@ task.spawn(function()
 end)
 
 -- Auto-close popup pagi ("Lanjut Berdagang" / NightReportGui, LevelUpGui, TuyulLiar, Dukun)
+-- Gaya manusiawi: tunggu popup selesai muncul (reaksi 0.6-1.4s), klik SATU koneksi sekali,
+-- lalu cooldown per tombol. Versi lama nembak Activated + MouseButton1Click sekaligus tiap 1s -> UI glitch.
 task.spawn(function()
+	local seenAt = setmetatable({}, { __mode = "k" }) -- tombol -> kapan pertama terlihat
+	local clickedAt = setmetatable({}, { __mode = "k" }) -- tombol -> kapan terakhir diklik
+
+	local function shown(o)
+		while o and o:IsA("GuiObject") do
+			if not o.Visible then return false end
+			o = o.Parent
+		end
+		return o ~= nil
+	end
+
+	-- true kalau klik terkirim
 	local function clickBtn(b)
-		if not b or not b:IsA("GuiButton") then return false end
-		local ran = false
+		if not b or not b:IsA("GuiButton") or not shown(b) then
+			if b then seenAt[b] = nil end
+			return false
+		end
+		local now = os.clock()
+		if not seenAt[b] then
+			seenAt[b] = now + 0.6 + math.random() * 0.8 -- waktu reaksi + tunggu animasi masuk
+			return false
+		end
+		if now < seenAt[b] then return false end
+		if clickedAt[b] and now - clickedAt[b] < 3 then return false end -- belum nutup? jangan spam
+		clickedAt[b] = now
+		seenAt[b] = nil -- popup berikutnya kena jeda reaksi lagi
 		for _, sig in ipairs({ b.Activated, b.MouseButton1Click }) do
-			local conns = getconnections and getconnections(sig) or {}
-			for _, c in ipairs(conns) do
-				if type(c.Fire) == "function" then
-					c:Fire()
-					ran = true
-				elseif type(c.Function) == "function" then
+			for _, c in ipairs(getconnections and getconnections(sig) or {}) do
+				if type(c.Function) == "function" then
 					task.spawn(c.Function)
-					ran = true
+					return true
+				elseif type(c.Fire) == "function" then
+					pcall(c.Fire, c)
+					return true
 				end
 			end
 		end
-		return ran
+		return false
 	end
 
 	while isRunValid() do
-		task.wait(1)
+		task.wait(0.4 + math.random() * 0.3)
 		pcall(function()
 			local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
 			if not pg then return end
@@ -4527,9 +4654,10 @@ task.spawn(function()
 			if nr and nr.Enabled then
 				local card = nr:FindFirstChild("Overlay", true)
 				local okBtn = card and card:FindFirstChild("OkButton", true)
-				local overlayCloser = nr:FindFirstChild("OverlayCloser", true)
-				if not clickBtn(okBtn) then
-					clickBtn(overlayCloser)
+				if okBtn and shown(okBtn) then
+					clickBtn(okBtn)
+				else
+					clickBtn(nr:FindFirstChild("OverlayCloser", true))
 				end
 			end
 
@@ -4537,23 +4665,20 @@ task.spawn(function()
 			local lvl = pg:FindFirstChild("LevelUpGui")
 			if lvl and lvl.Enabled then
 				local okBtn = lvl:FindFirstChild("OkButton", true)
-				local txtBtn = lvl:FindFirstChild("TextButton", true)
-				if not clickBtn(okBtn) then clickBtn(txtBtn) end
+				clickBtn((okBtn and shown(okBtn)) and okBtn or lvl:FindFirstChild("TextButton", true))
 			end
 
 			-- 3) Tuyul Liar Lapor Gui
 			local tuyul = pg:FindFirstChild("TuyulLiarGui")
 			if tuyul and tuyul.Enabled then
-				local okBtn = tuyul:FindFirstChild("OkButton", true)
-				clickBtn(okBtn)
+				clickBtn(tuyul:FindFirstChild("OkButton", true))
 			end
 
 			-- 4) Dukun Abuse / Kartu Pesan "Oke"
 			local dukun = pg:FindFirstChild("DukunAbuseGui")
 			if dukun and dukun.Enabled then
 				local pesan = dukun:FindFirstChild("KartuPesan", true)
-				local tombol = pesan and pesan.Visible and pesan:FindFirstChild("Tombol")
-				clickBtn(tombol)
+				clickBtn(pesan and pesan:FindFirstChild("Tombol"))
 			end
 		end)
 	end
@@ -4570,10 +4695,19 @@ getgenv().DiscordBridgeUrl = getgenv().DiscordBridgeUrl or ""
 getgenv().DiscordBridgeKey = getgenv().DiscordBridgeKey or ""
 getgenv().DiscordRemoteEnabled = getgenv().DiscordRemoteEnabled == true
 
+-- Config discord di file sendiri, SELALU dibaca (rejoin manual juga), tidak ketimpa save lapak.
+local myId = (LocalPlayer.UserId and LocalPlayer.UserId > 0) and tostring(LocalPlayer.UserId) or LocalPlayer.Name
+local DiscordConfigFile = "PasarHutan_Discord_" .. myId .. ".json"
+
 -- Muat URL tersimpan kalau ada
 pcall(function()
-	if PersistenceManager and PersistenceManager.state and type(PersistenceManager.state.discord) == "table" then
-		local d = PersistenceManager.state.discord
+	local d
+	if isfile and readfile and isfile(DiscordConfigFile) then
+		d = PersistenceManager.http:JSONDecode(readfile(DiscordConfigFile))
+	elseif PersistenceManager.state and type(PersistenceManager.state.discord) == "table" then
+		d = PersistenceManager.state.discord -- migrasi dari format lama
+	end
+	if type(d) == "table" then
 		if type(d.webhook) == "string" and d.webhook ~= "" then
 			getgenv().DiscordWebhookUrl = d.webhook
 		end
@@ -4596,22 +4730,16 @@ pcall(function()
 end)
 
 local function simpanDiscordConfig()
+	if not writefile then return end
 	pcall(function()
-		if PersistenceManager then
-			PersistenceManager.state = PersistenceManager.state or {}
-			PersistenceManager.state.discord = {
-				webhook = getgenv().DiscordWebhookUrl or "",
-				bridge = getgenv().DiscordBridgeUrl or "",
-				key = getgenv().DiscordBridgeKey or "",
-				auto = getgenv().DiscordAutoReport == true,
-				interval = getgenv().DiscordReportInterval or 5,
-				remote = getgenv().DiscordRemoteEnabled == true,
-			}
-			local s = PersistenceManager.http:JSONEncode(PersistenceManager.state)
-			if writefile then
-				pcall(writefile, PersistenceManager.stateFile, s)
-			end
-		end
+		writefile(DiscordConfigFile, PersistenceManager.http:JSONEncode({
+			webhook = getgenv().DiscordWebhookUrl or "",
+			bridge = getgenv().DiscordBridgeUrl or "",
+			key = getgenv().DiscordBridgeKey or "",
+			auto = getgenv().DiscordAutoReport == true,
+			interval = getgenv().DiscordReportInterval or 5,
+			remote = getgenv().DiscordRemoteEnabled == true,
+		}))
 	end)
 end
 
@@ -5010,6 +5138,246 @@ task.spawn(function()
 	end
 end)
 end)()
+
+-- ======================================================================
+-- SUPPLY DIRECTOR (Smart Cycle): jaga stok bahan otomatis.
+--  * Meja Tempa: olah PapanKayu (6 Kayu, 12 dtk) & BatuAsah (10 Batu, 15 dtk) kalau di bawah batas.
+--  * Bahan mentah kurang -> pinjam farm worker (Pohon/Kepiting/Dupa) sampai target, lalu balik ke Batu.
+--  * Sate Kepiting (3 KepitingSungai + 1 Dupa) dimasak otomatis kalau stok pakan babi menipis.
+-- Hysteresis (min/target) supaya tidak bolak-balik tiap kurang 1 biji.
+-- ======================================================================
+local SupplyConfig = {
+	-- item = { min (mulai isi), target (berhenti isi) }
+	Kayu = { min = 40, target = 150 }, -- dipakai PapanKayu (6), BatangBesi (4), repair KapakKayu (10)
+	PapanKayu = { min = 12, target = 30 }, -- repair Beliung Arwah butuh 10
+	BatuAsah = { min = 6, target = 20 }, -- repair maks 4
+	SateKepiting = { min = 4, target = 12 },
+	KepitingSungai = { perMasak = 3 },
+	Dupa = { perMasak = 1 },
+}
+getgenv().PH_SupplyBusy = false
+
+local function hitungTas(id)
+	local n = 0
+	for _, c in ipairs({ LocalPlayer:FindFirstChildOfClass("Backpack"), LocalPlayer.Character }) do
+		if c then
+			for _, t in ipairs(c:GetChildren()) do
+				if t:IsA("Tool") and (t:GetAttribute("ItemId") == id or t.Name == id) then
+					n += tonumber(t:GetAttribute("Count")) or 1
+				end
+			end
+		end
+	end
+	return n
+end
+
+task.spawn(function()
+	local FARM_UI = {
+		PohonFarmActive = function() setFarmToggleUI("PohonFarmActive", PohonToggleBtn, PohonStatusLabel, "Pohon") end,
+		KepitingFarmActive = function() setFarmToggleUI("KepitingFarmActive", KepitingToggleBtn, KepitingStatusLabel, "Kepiting") end,
+		DupaFarmActive = function() setFarmToggleUI("DupaFarmActive", DupaToggleBtn, DupaStatusLabel, "Dupa") end,
+		BatuFarmActive = function() setFarmToggleUI("BatuFarmActive", BatuToggleBtn, BatuStatusLabel, "Batu") end,
+	}
+	local function setFarm(flag, on)
+		if getgenv()[flag] ~= on then
+			getgenv()[flag] = on
+			pcall(FARM_UI[flag])
+		end
+	end
+
+	-- Farm bahan mentah yang sedang "dipinjam": { flag, item, target }
+	local borrowed = nil
+	local function release()
+		if borrowed then
+			setFarm(borrowed.flag, false)
+			borrowed = nil
+		end
+		setFarm("BatuFarmActive", true) -- default idle Smart Cycle
+	end
+	-- item yang farm-nya macet (malam / batas harian / node habis) -> istirahat dulu
+	local skipUntil = {}
+	local function borrow(flag, item, target, label)
+		if borrowed and borrowed.flag == flag then return end
+		if skipUntil[item] and tick() < skipUntil[item] then return end
+		if borrowed then setFarm(borrowed.flag, false) end
+		setFarm("BatuFarmActive", false)
+		borrowed = { flag = flag, item = item, target = target, last = hitungTas(item), lastT = tick() }
+		setFarm(flag, true)
+		SmartUI.supplyInfo = label
+	end
+
+	-- Kebutuhan bahan mentah, urut prioritas. Kembalikan { flag, item, target, label } atau nil.
+	local function kebutuhanMentah()
+		local C = SupplyConfig
+		local kayu = hitungTas("Kayu")
+		local papanKurang = hitungTas("PapanKayu") < C.PapanKayu.min
+		-- Kayu kurang (atau papan kurang dan kayu tak cukup untuk 1 batch papan)
+		if kayu < C.Kayu.min or (papanKurang and kayu < 6) then
+			return { flag = "PohonFarmActive", item = "Kayu", target = C.Kayu.target,
+				label = string.format("Tebang pohon (Kayu %d/%d)", kayu, C.Kayu.target) }
+		end
+		-- Pakan babi: hanya kalau fitur babi menyala
+		if getgenv().AutoBabiActive and hitungTas("SateKepiting") < C.SateKepiting.min then
+			local porsi = C.SateKepiting.target - hitungTas("SateKepiting")
+			local kep, dupa = hitungTas("KepitingSungai"), hitungTas("Dupa")
+			local needKep = porsi * C.KepitingSungai.perMasak
+			local needDupa = porsi * C.Dupa.perMasak
+			if kep < C.KepitingSungai.perMasak then
+				return { flag = "KepitingFarmActive", item = "KepitingSungai", target = needKep,
+					label = string.format("Cari kepiting (%d/%d)", kep, needKep) }
+			end
+			if dupa < C.Dupa.perMasak then
+				return { flag = "DupaFarmActive", item = "Dupa", target = needDupa,
+					label = string.format("Cari dupa (%d/%d)", dupa, needDupa) }
+			end
+		end
+		return nil
+	end
+
+	-- Meja Tempa: buka hasil siap / antre PapanKayu & BatuAsah
+	local function mejaPos()
+		local root = workspace:FindFirstChild("KiosAktif")
+		local kios = root and (root:FindFirstChild("Kios_" .. LocalPlayer.Name))
+		if root and not kios then
+			for _, k in ipairs(root:GetChildren()) do
+				if k:GetAttribute("OwnerUserId") == LocalPlayer.UserId then kios = k break end
+			end
+		end
+		local p = kios and kios:FindFirstChild("pCraft", true)
+		if p and p:IsA("Attachment") then return p.WorldPosition end
+		return p and p:IsA("BasePart") and p.Position or nil
+	end
+	local function tempa(payload)
+		if not RemoteTempaAksi then return nil end
+		local ok, res = pcall(function() return RemoteTempaAksi:InvokeServer(payload) end)
+		return ok and type(res) == "table" and res or nil
+	end
+	local function rencanaMeja(st)
+		local q = (st.antrian and st.antrian.Meja) or {}
+		local terisi, jalan = 0, {}
+		for _, it in pairs(q) do
+			if type(it) == "table" then
+				terisi += 1
+				if it.status == "siap" and it.id then
+					return { { aksi = "buka", stasiun = "Meja", id = it.id } }
+				end
+				jalan[it.resep or ""] = true
+			end
+		end
+		local slot = (st.slot and st.slot.Meja) or 1
+		local b = st.bahan or {}
+		local C = SupplyConfig
+		local jobs = {}
+		local function antre(resep, punya, cfg, bahanPunya, perUnit)
+			if terisi >= slot or jalan[resep] or punya >= cfg.min then return end
+			local n = math.min(cfg.target - punya, math.floor(bahanPunya / perUnit), 100)
+			if n >= 1 then
+				table.insert(jobs, { aksi = "antre", resep = resep, jumlah = n })
+				terisi += 1
+			end
+		end
+		-- Sisakan Kayu untuk lebur besi & repair kapak kayu: papan hanya pakai kayu di atas min
+		antre("PapanKayu", b.PapanKayu or 0, C.PapanKayu, math.max(0, (b.Kayu or 0) - 20), 6)
+		antre("BatuAsah", b.BatuAsah or 0, C.BatuAsah, b.Batu or 0, 10)
+		return jobs
+	end
+
+	-- Masak Sate Kepiting kalau bahan siap
+	local nextMasak = 0
+	local function masakSate()
+		if not (RemoteCookStove and getgenv().AutoBabiActive) or tick() < nextMasak then return end
+		if hitungTas("SateKepiting") >= SupplyConfig.SateKepiting.min then return end
+		local bisa = math.min(math.floor(hitungTas("KepitingSungai") / 3), hitungTas("Dupa"))
+		if bisa < 1 then return end
+		nextMasak = tick() + 60 + math.random() * 30 -- masak 90 dtk; jangan bolak-balik ke kompor
+		getgenv().PH_SupplyBusy = true
+		SmartUI.supplyInfo = "Masak Sate Kepiting"
+		pcall(FarmHelpers.goToStove)
+		local okPoll, q = pcall(function() return RemoteCookQueuePoll and RemoteCookQueuePoll:InvokeServer() end)
+		local sisaSlot = (okPoll and type(q) == "table" and q.ok) and ((q.maxQueue or 3) - #(q.slots or {})) or 1
+		for _ = 1, math.min(bisa, sisaSlot) do
+			local ok, r = pcall(function() return RemoteCookStove:InvokeServer("SateKepiting") end)
+			if not (ok and type(r) == "table" and r.ok) then break end
+			task.wait(0.8 + math.random() * 0.5)
+		end
+		getgenv().PH_SupplyBusy = false
+	end
+
+	local lastMeja = 0
+	while isRunValid() do
+		task.wait(3 + math.random() * 2)
+		if not getgenv().SmartCycleActive then
+			if borrowed then setFarm(borrowed.flag, false) borrowed = nil end
+			getgenv().PH_SupplyBusy = false
+			SmartUI.supplyInfo = nil
+			continue
+		end
+		-- jangan rebutan karakter dengan tugas lain
+		if getgenv().PH_Repairing or getgenv().PH_LeburBusy or getgenv().PH_WijayaBusy or getgenv().PH_KandangBusy then
+			continue
+		end
+
+		-- 1) Farm pinjaman: sudah capai target?
+		if borrowed then
+			local punya = hitungTas(borrowed.item)
+			if punya > borrowed.last then
+				borrowed.last, borrowed.lastT = punya, tick()
+			end
+			if punya >= borrowed.target then
+				release()
+			elseif tick() - borrowed.lastT > 240 then
+				-- 4 menit tanpa tambahan: hutan tutup / batas harian / node habis. Jangan nyangkut.
+				warn("[Supply] " .. borrowed.item .. " tidak bertambah 4 menit, coba lagi 15 menit lagi")
+				skipUntil[borrowed.item] = tick() + 900
+				release()
+			else
+				SmartUI.supplyInfo = string.format("Mengumpulkan %s %d/%d", borrowed.item, punya, borrowed.target)
+				continue -- biarkan worker farm bekerja
+			end
+		end
+
+		-- 2) Masak sate (cepat, sekali mampir ke kompor)
+		pcall(masakSate)
+
+		-- 3) Meja Tempa: cek tiap ~20 dtk saja (hemat remote)
+		if tick() - lastMeja > 30 then
+			lastMeja = tick() + math.random() * 15 -- 30-45 dtk, tidak berirama tetap
+			local st = tempa({ aksi = "state" })
+			if st and st.ok and st.meja then
+				local jobs = rencanaMeja(st)
+				local pos = #jobs > 0 and mejaPos()
+				if pos and getAliveHRPAndHum() then
+					getgenv().PH_SupplyBusy = true
+					SmartUI.supplyInfo = "Mengurus Meja Tempa"
+					task.wait(0.4)
+					setBodyVelocityZero(true)
+					smoothMoveTo(pos + Vector3.new(0, 3, 0), function()
+						return not isRunValid() or not getgenv().SmartCycleActive or not getAliveHRPAndHum()
+					end)
+					task.wait(0.4 + math.random() * 0.3)
+					for _, job in ipairs(jobs) do
+						local res = tempa(job)
+						if res and not res.ok then
+							warn("[Supply] Meja menolak " .. tostring(job.resep or job.aksi) .. ": " .. tostring(res.reason or res.alasan or res.err or "?"))
+						end
+						task.wait(0.6 + math.random() * 0.4)
+					end
+					setBodyVelocityZero(false)
+					getgenv().PH_SupplyBusy = false
+				end
+			end
+		end
+
+		-- 4) Bahan mentah kurang? pinjam farm worker
+		local need = kebutuhanMentah()
+		if need then
+			borrow(need.flag, need.item, need.target, need.label)
+		else
+			SmartUI.supplyInfo = nil
+			if not getgenv().BatuFarmActive then setFarm("BatuFarmActive", true) end
+		end
+	end
+end)
 
 -- Worker lebur: BatangBesi = BijiBesi x5 + Kayu x4 (TempaConfig.Resep.BatangBesi, 120 dtk, maks 50/batch)
 task.spawn(function()
@@ -5411,7 +5779,7 @@ task.spawn(function()
 						if not _sJ then
 							_sq[_sD] = tick() + TanamanWaterCooldown
 						end
-						task.wait(0.2)
+						task.wait(0.4 + math.random() * 0.4)
 					end
 				end
 			end
@@ -5620,8 +5988,8 @@ local function startFarmWorker(_tD)
 		local _tF = nil
 		local _tG = false
 		local function _kandangYield()
-			return _tD.name == "Batu"
-				and (getgenv().PH_KandangBusy == true or getgenv().PH_LeburBusy == true or getgenv().PH_WijayaBusy == true)
+			return (_tD.name == "Batu" or getgenv().SmartCycleActive == true)
+				and (getgenv().PH_KandangBusy == true or getgenv().PH_LeburBusy == true or getgenv().PH_WijayaBusy == true or getgenv().PH_SupplyBusy == true)
 		end
 		local function _tH()
 			return isRunValid() and getgenv()[_tD.flag] and not getgenv().PH_Repairing and not _kandangYield()
@@ -5664,6 +6032,7 @@ local function startFarmWorker(_tD)
 				FarmHelpers.restoreCam()
 				_tD.status.Text = getgenv().PH_WijayaBusy and "Pause: beli Air Kembang..."
 					or getgenv().PH_LeburBusy and "Pause: mengurus tungku..."
+					or getgenv().PH_SupplyBusy and "Pause: kompor / meja tempa..."
 					or "Pause: mengurus kandang..."
 				task.wait(0.5)
 				continue
@@ -7101,7 +7470,7 @@ task.spawn(function()
 			_zj(1)
 			_wt[_yZ.prompt] = tick() + 6
 		end
-		task.wait(_yZ.role == "panen" and 0.05 or 0.2)
+		task.wait(0.3 + math.random() * 0.3)
 		return true
 	end
 	while isRunValid() do

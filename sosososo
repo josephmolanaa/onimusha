@@ -908,114 +908,29 @@ local function smoothMoveTo(_fe, _ff, _fg)
 	end
 	return true
 end
--- Posisi dunia sebuah prompt (parent BasePart / Attachment / Model)
-local function promptWorldPos(p)
-	local par = p and p.Parent
-	if not par then return nil end
-	if par:IsA("Attachment") then return par.WorldPosition end
-	if par:IsA("BasePart") then return par.Position end
-	if par:IsA("Model") then return par:GetPivot().Position end
-	return nil
-end
-
--- Prompt berdekatan (gosok/ambil/palung babi) sering "tabrakan": E / hold kena prompt lain.
--- Selama interaksi, prompt lain dalam radius dimatikan LOKAL lewat MaxActivationDistance=0
--- (bukan Enabled, supaya tidak melawan toggle dari server), lalu dikembalikan.
-local PROMPT_ISOLATE_RADIUS = 14
--- Registry global: prompt -> jarak asli. Dipakai bersama (refcount) & dipulihkan saat script di-reload,
--- supaya prompt tidak pernah "nyangkut" mati kalau run sebelumnya crash di tengah hold.
-local IsolatedPrompts = getgenv().PH_IsolatedPrompts or {}
-getgenv().PH_IsolatedPrompts = IsolatedPrompts
-for p, rec in pairs(IsolatedPrompts) do
-	pcall(function() p.MaxActivationDistance = rec.dist end)
-	IsolatedPrompts[p] = nil
-end
-local function isolatePrompt(target)
-	local pos = promptWorldPos(target)
-	local saved = {}
-	if not pos then return saved end
-	local function take(d)
-		if d == target or saved[d] or not d:IsA("ProximityPrompt") then return end
-		local dp = promptWorldPos(d)
-		if not dp or (dp - pos).Magnitude > PROMPT_ISOLATE_RADIUS then return end
-		local rec = IsolatedPrompts[d]
-		if rec then
-			rec.n += 1
-		elseif d.MaxActivationDistance > 0 then
-			IsolatedPrompts[d] = { dist = d.MaxActivationDistance, n = 1 }
-			d.MaxActivationDistance = 0
-		else
-			return
-		end
-		saved[d] = true
-	end
-	-- 1) Satu kandang/model yang sama (lengkap, termasuk prompt di Model & part CanQuery=false)
-	local root = target.Parent
-	while root and root.Parent ~= workspace and not root.Name:find("^Kandang") do
-		root = root.Parent
-	end
-	if root and root ~= workspace then
-		for _, d in ipairs(root:GetDescendants()) do take(d) end
-	end
-	-- 2) Tetangga di luar kandang (babi yang jalan-jalan, palung, dll)
-	local ok, parts = pcall(workspace.GetPartBoundsInRadius, workspace, pos, PROMPT_ISOLATE_RADIUS)
-	if ok then
-		for _, part in ipairs(parts) do
-			local m = part.Parent
-			for _, d in ipairs((m and m ~= workspace and m:IsA("Model") and m or part):GetDescendants()) do
-				take(d)
-			end
-		end
-	end
-	return saved
-end
-local function restorePrompts(saved)
-	for p in pairs(saved) do
-		local rec = IsolatedPrompts[p]
-		if rec then
-			rec.n = rec.n - 1
-			if rec.n <= 0 then
-				IsolatedPrompts[p] = nil
-				if p.Parent and p.MaxActivationDistance == 0 then
-					p.MaxActivationDistance = rec.dist
-				end
-			end
-		end
-	end
-end
-
 local function fireProximityPromptSafe(_fn, _fo)
 	if not (_fn and _fn.Parent and _fn.Enabled) then
 		return
 	end
-	local _fp = (_fo or _fn.HoldDuration or PromptDefaultHold) + math.random() * 0.15
+	local _fp = (_fo or _fn.HoldDuration or PromptDefaultHold) + math.random() * 0.12
 	if fireproximityprompt then
-		-- langsung ke instance target: tidak bisa "nyasar" ke prompt tetangga
 		task.wait(0.08 + math.random() * 0.12)
 		pcall(fireproximityprompt, _fn, _fp + 0.05)
 		task.wait(0.25 + math.random() * 0.15)
-		return
-	end
-	local saved = {}
-	pcall(function() saved = isolatePrompt(_fn) end)
-	-- pcall: apa pun yang error di tengah hold, prompt lain tetap dipulihkan di bawah
-	pcall(function()
-		task.wait(0.08 + math.random() * 0.12) -- beri waktu UI prompt pindah ke target
-		if PromptInteractMode == "fire" and fireproximityprompt then
-			fireproximityprompt(_fn, _fp + 0.1)
-			task.wait(0.2)
-		elseif PromptInteractMode == "vim" then
+	elseif PromptInteractMode == "vim" then
+		pcall(function()
 			VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
 			task.wait(_fp + 0.05)
 			VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-		else
+		end)
+	else
+		pcall(function()
 			_fn:InputHoldBegin()
 			task.wait(_fp + 0.05)
 			_fn:InputHoldEnd()
-		end
-	end)
-	restorePrompts(saved)
-	task.wait(0.15 + math.random() * 0.2) -- jeda manusiawi antar interaksi, anti-spam
+		end)
+	end
+	task.wait(0.15 + math.random() * 0.2)
 end
 local function getMyPlotAndFarm()
 	local _fr = workspace:FindFirstChild("Plot") or workspace:FindFirstChild("Plots")

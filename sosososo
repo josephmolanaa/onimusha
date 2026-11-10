@@ -913,7 +913,8 @@ local function fireProximityPromptSafe(_fn, _fo)
 		return
 	end
 	local _fp = (_fo or _fn.HoldDuration or PromptDefaultHold) + math.random() * 0.12
-	if fireproximityprompt then
+	-- ponytail: fireproximityprompt di Delta Android ada tapi no-op; default pakai hold (terbukti jalan).
+	if PromptInteractMode == "fire" and fireproximityprompt then
 		task.wait(0.08 + math.random() * 0.12)
 		pcall(fireproximityprompt, _fn, _fp + 0.05)
 		task.wait(0.25 + math.random() * 0.15)

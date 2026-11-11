@@ -697,6 +697,38 @@ task.spawn(function()
 		end
 	end
 end)
+-- Anti-jatuh: noclip (di bawah) + pengapung dilepas tugas lain = karakter mulai jatuh bebas.
+-- Tangkap di frame pertama jatuh (bukan tunggu Y < 80), kembalikan ke posisi stabil terakhir & pasang pengapung.
+do
+	local lastStable
+	table.insert(
+		GlobalConnections,
+		RunService.Heartbeat:Connect(function()
+			if not isRunValid() or getgenv().PH_WalkCtx() or not isAnyFarmActive() then
+				lastStable = nil
+				return
+			end
+			local hrp = getAliveHRPAndHum()
+			if not hrp then
+				lastStable = nil
+				return
+			end
+			local vy = hrp.AssemblyLinearVelocity.Y
+			if math.abs(vy) < 5 or hrp:FindFirstChild("FlyLockPos") then
+				lastStable = hrp.Position -- diam / berdiri: titik aman
+			end
+			-- lompat biasa mendarat ~-50; jatuh bebas lewat -85 setelah ~16 stud
+			if vy > -85 then
+				return
+			end
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			if lastStable then
+				hrp.CFrame = CFrame.new(lastStable) * hrp.CFrame.Rotation
+			end
+			setBodyVelocityZero(true)
+		end)
+	)
+end
 table.insert(
 	GlobalConnections,
 	RunService.Stepped:Connect(function()
@@ -908,30 +940,110 @@ local function smoothMoveTo(_fe, _ff, _fg)
 	end
 	return true
 end
+local isolatePrompt, restorePrompts -- do-block: hemat register lokal top-level (batas Luau 200)
+do
+-- Posisi dunia sebuah prompt (parent BasePart / Attachment / Model)
+local function promptWorldPos(p)
+	local par = p and p.Parent
+	if not par then return nil end
+	if par:IsA("Attachment") then return par.WorldPosition end
+	if par:IsA("BasePart") then return par.Position end
+	if par:IsA("Model") then return par:GetPivot().Position end
+	return nil
+end
+
+-- Prompt berdekatan (gosok/ambil/palung babi) sering "tabrakan": E / hold kena prompt lain.
+-- Selama interaksi, prompt lain dalam radius dimatikan LOKAL lewat MaxActivationDistance=0
+-- (bukan Enabled, supaya tidak melawan toggle dari server), lalu dikembalikan.
+local PROMPT_ISOLATE_RADIUS = 14
+-- Registry global: prompt -> jarak asli. Dipakai bersama (refcount) & dipulihkan saat script di-reload,
+-- supaya prompt tidak pernah "nyangkut" mati kalau run sebelumnya crash di tengah hold.
+local IsolatedPrompts = getgenv().PH_IsolatedPrompts or {}
+getgenv().PH_IsolatedPrompts = IsolatedPrompts
+for p, rec in pairs(IsolatedPrompts) do
+	pcall(function() p.MaxActivationDistance = rec.dist end)
+	IsolatedPrompts[p] = nil
+end
+function isolatePrompt(target)
+	local pos = promptWorldPos(target)
+	local saved = {}
+	if not pos then return saved end
+	local function take(d)
+		if d == target or saved[d] or not d:IsA("ProximityPrompt") then return end
+		local dp = promptWorldPos(d)
+		if not dp or (dp - pos).Magnitude > PROMPT_ISOLATE_RADIUS then return end
+		local rec = IsolatedPrompts[d]
+		if rec then
+			rec.n += 1
+		elseif d.MaxActivationDistance > 0 then
+			IsolatedPrompts[d] = { dist = d.MaxActivationDistance, n = 1 }
+			d.MaxActivationDistance = 0
+		else
+			return
+		end
+		saved[d] = true
+	end
+	-- 1) Satu kandang/model yang sama (lengkap, termasuk prompt di Model & part CanQuery=false)
+	local root = target.Parent
+	while root and root.Parent ~= workspace and not root.Name:find("^Kandang") do
+		root = root.Parent
+	end
+	if root and root ~= workspace then
+		for _, d in ipairs(root:GetDescendants()) do take(d) end
+	end
+	-- 2) Tetangga di luar kandang (babi yang jalan-jalan, palung, dll)
+	local ok, parts = pcall(workspace.GetPartBoundsInRadius, workspace, pos, PROMPT_ISOLATE_RADIUS)
+	if ok then
+		for _, part in ipairs(parts) do
+			local m = part.Parent
+			for _, d in ipairs((m and m ~= workspace and m:IsA("Model") and m or part):GetDescendants()) do
+				take(d)
+			end
+		end
+	end
+	return saved
+end
+function restorePrompts(saved)
+	for p in pairs(saved) do
+		local rec = IsolatedPrompts[p]
+		if rec then
+			rec.n -= 1
+			if rec.n <= 0 then
+				IsolatedPrompts[p] = nil
+				if p.Parent and p.MaxActivationDistance == 0 then
+					p.MaxActivationDistance = rec.dist
+				end
+			end
+		end
+	end
+end
+end
+
 local function fireProximityPromptSafe(_fn, _fo)
 	if not (_fn and _fn.Parent and _fn.Enabled) then
 		return
 	end
-	local _fp = (_fo or _fn.HoldDuration or PromptDefaultHold) + math.random() * 0.12
-	-- ponytail: fireproximityprompt di Delta Android ada tapi no-op; default pakai hold (terbukti jalan).
-	if PromptInteractMode == "fire" and fireproximityprompt then
-		task.wait(0.08 + math.random() * 0.12)
-		pcall(fireproximityprompt, _fn, _fp + 0.05)
-		task.wait(0.25 + math.random() * 0.15)
-	elseif PromptInteractMode == "vim" then
-		pcall(function()
+	local _fp = (_fo or _fn.HoldDuration or PromptDefaultHold) + math.random() * 0.15
+	local saved = {}
+	pcall(function() saved = isolatePrompt(_fn) end)
+	-- pcall: apa pun yang error di tengah hold, prompt lain tetap dipulihkan di bawah
+	pcall(function()
+		task.wait(0.08 + math.random() * 0.12) -- beri waktu UI prompt pindah ke target
+		if PromptInteractMode == "fire" and fireproximityprompt then
+			fireproximityprompt(_fn, _fp + 0.1)
+			task.wait(0.2)
+		elseif PromptInteractMode == "vim" then
 			VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
 			task.wait(_fp + 0.05)
 			VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-		end)
-	else
-		pcall(function()
+		else
 			_fn:InputHoldBegin()
 			task.wait(_fp + 0.05)
 			_fn:InputHoldEnd()
-		end)
-	end
-	task.wait(0.15 + math.random() * 0.2)
+		end
+	end)
+	restorePrompts(saved)
+	task.wait(0.15 + math.random() * 0.2) -- jeda manusiawi antar interaksi, anti-spam
 end
 local function getMyPlotAndFarm()
 	local _fr = workspace:FindFirstChild("Plot") or workspace:FindFirstChild("Plots")
@@ -2767,6 +2879,25 @@ do
 					or string.find(_nV.Name, "Babi Ngepet", 1, true) ~= nil
 				)
 		end
+		-- Babi tipe khusus (varian/langka) = DISIMPAN: tidak dipanggang, tidak dijual.
+		-- ponytail: deteksi dari atribut kelangkaan + kata kunci nama; kalau game pakai atribut lain, tambah di sini.
+		local VARIAN = { "boy", "detektif", "labu", "pita", "penyihir", "daun", "raja", "ceplok", "bunga", "jerami", "imut",
+			"mitos", "sultan", "siluman", "langka" }
+		_nS.khusus = function(t)
+			for _, a in ipairs({ "babiKelangkaan", "Kelangkaan", "kelangkaan", "babiVarian", "Varian", "babiTipe", "Tipe", "Rarity" }) do
+				local v = t:GetAttribute(a)
+				if v ~= nil and v ~= "" and string.lower(tostring(v)) ~= "biasa" then
+					return true
+				end
+			end
+			local nm = string.lower(t.Name .. " " .. tostring(t:GetAttribute("babiNama") or ""))
+			for _, k in ipairs(VARIAN) do
+				if string.find(nm, k, 1, true) then
+					return true
+				end
+			end
+			return false
+		end
 		_nS.scan = function()
 			local _nW = {}
 			local function _nX(_nY)
@@ -2780,6 +2911,7 @@ do
 							kg = tonumber(_oa:GetAttribute("babiBerat")) or 0,
 							locked = _oa:GetAttribute("babiKunci") == true,
 							id = _oa:GetAttribute("idBabi") or _oa.Name,
+							khusus = _nS.khusus(_oa),
 						}
 					end
 				end
@@ -2796,7 +2928,7 @@ do
 			if _oe and tick() < _oe then
 				return false
 			end
-			return _od.kg >= _nS.minKg and not _od.locked
+			return _od.kg >= _nS.minKg and not _od.locked and not _od.khusus
 		end
 		_nS.pick = function()
 			local _of = getgenv().PanggangBabiKg
@@ -3481,7 +3613,31 @@ do
 	_qp.Position = UDim2.new(0.5, -22, 0.5, -22)
 	_qp.BackgroundColor3 = UITheme.panel
 	_qp.BackgroundTransparency = 0.10
+	-- Ikon bebek (frame 1 sprite, PNG transparan) ditanam base64 -> file lokal -> getcustomasset.
+	-- Fallback ke ikon lama kalau executor tidak punya writefile/getcustomasset.
 	_qp.Image = "rbxassetid://126288919846878"
+	pcall(function()
+		local path = "PasarHutan_Duck.png"
+		if not (isfile and isfile(path)) then
+			local b64 = "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"
+			local map, out = {}, {}
+			local abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+			for i = 1, 64 do map[abc:byte(i)] = i - 1 end
+			for i = 1, #b64, 4 do
+				local a, b, c, d = map[b64:byte(i)], map[b64:byte(i + 1)], map[b64:byte(i + 2)], map[b64:byte(i + 3)]
+				local n = a * 262144 + b * 4096 + (c or 0) * 64 + (d or 0)
+				out[#out + 1] = string.char(n // 65536)
+				if c then out[#out + 1] = string.char(n // 256 % 256) end
+				if d then out[#out + 1] = string.char(n % 256) end
+			end
+			writefile(path, table.concat(out))
+		end
+		local id = (getcustomasset or getsynasset)(path)
+		if id and id ~= "" then
+			_qp.Image = id
+			_qp.ResampleMode = Enum.ResamplerMode.Pixelated
+		end
+	end)
 	_qp.ScaleType = Enum.ScaleType.Fit
 	_qp.AutoButtonColor = false
 	_qp.BorderSizePixel = 0
@@ -4152,7 +4308,10 @@ end
 -- SMART CYCLE: Kandang Babi (pakan/gosok/ambil) > Lebur Batang Besi > Mining Batu
 -- Prioritas lewat flag: PH_KandangBusy & PH_LeburBusy -> worker Batu pause.
 -- ======================================================================
-local SmartUI = { lebur = 0, wijayaBeli = 0, wijayaMinum = 0 }
+local SmartUI = { lebur = 0, wijayaBeli = 0, wijayaMinum = 0, sateMasak = 0, terjual = 0 }
+-- "tambang" = Kandang > Lebur > Mining (lama). "sate" = Kandang > Masak Sate Kepiting > Jual di lapak.
+getgenv().SmartCycleMode = getgenv().SmartCycleMode or "tambang"
+local FarmHelpers = {} -- dipakai Supply Director (goToStove) sebelum worker farm dibuat
 getgenv().AutoBeliWijayaActive = false
 getgenv().AutoMinumWijayaActive = false
 ;(function()
@@ -4163,7 +4322,7 @@ getgenv().AutoMinumWijayaActive = false
 	list.Parent = _sp
 
 	-- Kartu utama: status + tombol besar
-	local hero = createPanelFrame(_sp, UDim2.new(1, 0, 0, 92))
+	local hero = createPanelFrame(_sp, UDim2.new(1, 0, 0, 136))
 	hero.LayoutOrder = 1
 	SmartUI.dot = Instance.new("Frame")
 	SmartUI.dot.Size = UDim2.new(0, 10, 0, 10)
@@ -4172,10 +4331,12 @@ getgenv().AutoMinumWijayaActive = false
 	SmartUI.dot.BorderSizePixel = 0
 	SmartUI.dot.Parent = hero
 	applyUICorner(SmartUI.dot, 999)
-	SmartUI.title = createUILabel(hero, "Siap dijalankan", UDim2.new(1, -170, 0, 22), UDim2.new(0, 34, 0, 13), UITheme.text, UIFont.heavy, 16)
-	SmartUI.status = createUILabel(hero, "Kandang, tungku, lalu mining saat senggang", UDim2.new(1, -170, 0, 16), UDim2.new(0, 16, 0, 40), UITheme.sub, UIFont.regular, 11)
-	SmartUI.statusSub = createUILabel(hero, "Gerak aman", UDim2.new(1, -170, 0, 14), UDim2.new(0, 16, 0, 62), UITheme.dim, UIFont.regular, 10)
-	SmartUI.bigBtn = createUIButton(hero, UDim2.new(0, 128, 0, 40), UDim2.new(1, -144, 0.5, -20), "Mulai", UITheme.accent, 13, UITheme.dark)
+	SmartUI.title = createUILabel(hero, "Siap dijalankan", UDim2.new(1, -50, 0, 22), UDim2.new(0, 34, 0, 13), UITheme.text, UIFont.heavy, 16)
+	SmartUI.status = createUILabel(hero, "Pilih cycle: Mining atau Masak Sate", UDim2.new(1, -32, 0, 16), UDim2.new(0, 16, 0, 40), UITheme.sub, UIFont.regular, 11)
+	SmartUI.statusSub = createUILabel(hero, "Gerak aman", UDim2.new(1, -32, 0, 14), UDim2.new(0, 16, 0, 60), UITheme.dim, UIFont.regular, 10)
+	-- Dua tombol terpisah: masing-masing start/stop cycle-nya sendiri
+	SmartUI.btnMining = createUIButton(hero, UDim2.new(0.5, -20, 0, 40), UDim2.new(0, 14, 0, 84), "Cycle Mining", UITheme.accent, 13, UITheme.dark)
+	SmartUI.btnMasak = createUIButton(hero, UDim2.new(0.5, -20, 0, 40), UDim2.new(0.5, 6, 0, 84), "Cycle Masak", Color3.fromRGB(240, 128, 160), 13, UITheme.dark)
 	-- toggle tersembunyi: tetap jadi sumber state START/STOP untuk kode lama
 	SmartUI.masterToggle = createCompactToggle(hero, UDim2.new(0, 0, 0, 0), "START CYCLE", 1)
 	SmartUI.masterToggle.Visible = false
@@ -4196,12 +4357,12 @@ getgenv().AutoMinumWijayaActive = false
 		bar.Parent = t
 		applyUICorner(bar, 999)
 		local v = createUILabel(t, "0", UDim2.new(1, -30, 0, 24), UDim2.new(0, 22, 0, 10), UITheme.text, UIFont.heavy, 18)
-		createUILabel(t, label, UDim2.new(1, -24, 0, 14), UDim2.new(0, 12, 0, 40), UITheme.sub, UIFont.medium, 10)
-		return v
+		local l = createUILabel(t, label, UDim2.new(1, -24, 0, 14), UDim2.new(0, 12, 0, 40), UITheme.sub, UIFont.medium, 10)
+		return v, l
 	end
 	SmartUI.tBabi = tile(1, "Babi diambil", Color3.fromRGB(240, 128, 160))
-	SmartUI.tBesi = tile(2, "Batang besi diantre", Color3.fromRGB(242, 140, 40))
-	SmartUI.tBatu = tile(3, "Batu ditambang", Color3.fromRGB(140, 130, 118))
+	SmartUI.tBesi, SmartUI.lBesi = tile(2, "Batang besi diantre", Color3.fromRGB(242, 140, 40))
+	SmartUI.tBatu, SmartUI.lBatu = tile(3, "Batu ditambang", Color3.fromRGB(140, 130, 118))
 
 	-- Grup tugas, gaya daftar Settings iOS
 	local function group(order, title, rowCount)
@@ -4209,8 +4370,9 @@ getgenv().AutoMinumWijayaActive = false
 		h.LayoutOrder = order
 		local g = createPanelFrame(_sp, UDim2.new(1, 0, 0, rowCount * 32 + 4))
 		g.LayoutOrder = order + 1
-		return g
+		return g, h
 	end
+
 	local gK = group(3, "Kandang babi", 3)
 	local _rPakan, _setPakan = createSwitchRow(gK, 2, "Isi palung kalau kosong", false)
 	local _rGosok, _setGosok = createSwitchRow(gK, 34, "Gosok babi kotor", false)
@@ -4230,7 +4392,14 @@ getgenv().AutoMinumWijayaActive = false
 		getgenv().GosokSangatKotor = (_k == "sangat")
 	end, 9)
 
-	local gT = group(6, "Tambang & tungku", 3)
+	local gS, hS = group(6, "Sate kepiting, babi & lapak", 5)
+	local _rMasak, _setMasak = createSwitchRow(gS, 2, "Masak Sate Kepiting (3 kepiting + 1 dupa)", false)
+	local _rJual, _setJual = createSwitchRow(gS, 34, "Jual sate & Babi Guling di lapak", false)
+	local _rBahan, _setBahan = createSwitchRow(gS, 66, "Cari kepiting & dupa sendiri", false)
+	local _rPgg, _setPgg = createSwitchRow(gS, 98, "Panggang babi biasa >= 30 kg jadi Babi Guling", false)
+	local _rJB, _setJB = createSwitchRow(gS, 130, "Jual babi biasa < 30 kg ke Bandar (tipe khusus disimpan)", true)
+
+	local gT, hT = group(6, "Tambang & tungku", 3)
 	local _rBatu, _setBatu = createSwitchRow(gT, 2, "Mining batu saat senggang", false)
 	local _rLebur, _setLebur = createSwitchRow(gT, 34, "Lebur batang besi", false)
 	local _rRepair, _setRepair = createSwitchRow(gT, 66, "Perbaiki alat kalau durabilitas < 100", true)
@@ -4290,13 +4459,19 @@ getgenv().AutoMinumWijayaActive = false
 	local _rBeli, _setBeli = createSwitchRow(gL, 34, "Beli Air Kembang Wijaya kalau ada stok", false)
 	local _rMinum, _setMinum = createSwitchRow(gL, 66, "Minum Air Kembang tiap malam", true)
 
+	-- [4] = mode yang memakai baris ini (nil = semua mode)
 	local rows = {
 		{ _rPakan, _setPakan, "AutoBabiActive" },
 		{ _rGosok, _setGosok, "AutoGosokBabiActive" },
 		{ _rKlaim, _setKlaim, "AutoKlaimNgepetActive" },
-		{ _rBatu, _setBatu, "BatuFarmActive" },
-		{ _rLebur, _setLebur, "AutoLeburBesiActive" },
-		{ _rRepair, _setRepair, "AutoRepairActive" },
+		{ _rBatu, _setBatu, "BatuFarmActive", "tambang" },
+		{ _rLebur, _setLebur, "AutoLeburBesiActive", "tambang" },
+		{ _rRepair, _setRepair, "AutoRepairActive", "tambang" },
+		{ _rMasak, _setMasak, "SateCycleMasak", "sate" },
+		{ _rJual, _setJual, "SateCycleJual", "sate" },
+		{ _rBahan, _setBahan, "SateCycleBahan", "sate" },
+		{ _rPgg, _setPgg, "AutoPanggangActive", "sate" },
+		{ _rJB, _setJB, "SateCycleJualBabi", "sate" },
 		{ _rPetir, _setPetir, "AntiPetirActive" },
 		{ _rBeli, _setBeli, "AutoBeliWijayaActive" },
 		{ _rMinum, _setMinum, "AutoMinumWijayaActive" },
@@ -4306,10 +4481,18 @@ getgenv().AutoMinumWijayaActive = false
 		for _, r in ipairs(rows) do
 			r[2](getgenv()[r[3]] == true)
 		end
+		local sate = getgenv().SmartCycleMode == "sate"
+		gS.Visible, hS.Visible = sate, sate
+		gT.Visible, hT.Visible, leburRow.Visible = not sate, not sate, not sate
+		SmartUI.lBesi.Text = sate and "Sate dimasak" or "Batang besi diantre"
+		SmartUI.lBatu.Text = sate and "Sate ke lapak" or "Batu ditambang"
 		local on = getgenv().SmartCycleActive == true
+		local mineOn, masakOn = on and not sate, on and sate
 		SmartUI.masterToggle.Text = on and "STOP CYCLE" or "START CYCLE"
-		SmartUI.bigBtn.Text = on and "Berhenti" or "Mulai"
-		SmartUI.bigBtn.BackgroundColor3 = on and UITheme.danger or UITheme.accent
+		SmartUI.btnMining.Text = mineOn and "Stop Mining" or "Cycle Mining"
+		SmartUI.btnMining.BackgroundColor3 = mineOn and UITheme.danger or UITheme.accent
+		SmartUI.btnMasak.Text = masakOn and "Stop Masak" or "Cycle Masak"
+		SmartUI.btnMasak.BackgroundColor3 = masakOn and UITheme.danger or Color3.fromRGB(240, 128, 160)
 		SmartUI.dot.BackgroundColor3 = on and UITheme.on or UITheme.off
 		if not on then
 			SmartUI.title.Text = "Siap dijalankan"
@@ -4321,6 +4504,11 @@ getgenv().AutoMinumWijayaActive = false
 			TernakUI.apply(flag)
 		elseif flag == "BatuFarmActive" then
 			setFarmToggleUI("BatuFarmActive", BatuToggleBtn, BatuStatusLabel, "Batu")
+		elseif flag == "AutoPanggangActive" and LapakManager.pg and LapakManager.pg.toggle then
+			local pg, on = LapakManager.pg, getgenv().AutoPanggangActive == true
+			if on then pg.bad = {} end
+			pg.toggle.Text = on and "STOP PANGGANG" or "START PANGGANG"
+			pg.status.Text = on and "Status: Menuju pemangang..." or "Status: Berhenti"
 		end
 	end
 	SmartUI.applyFlag = _applyFlag
@@ -4335,26 +4523,48 @@ getgenv().AutoMinumWijayaActive = false
 	-- Mulai/Berhenti menyalakan semua tugas di atas sekaligus
 	function SmartUI.setCycle(on)
 		getgenv().SmartCycleActive = on
+		local mode = getgenv().SmartCycleMode
 		if on then
 			disableOtherFarms("AutoBabiActive") -- matikan farm lain yang bentrok; Batu & kandang tetap
-			getgenv().BatuBesiMode = true -- batu besar/sedang = peluang biji besi
+			if mode == "tambang" then
+				getgenv().BatuBesiMode = true -- batu besar/sedang = peluang biji besi
+			end
 		end
 		for _, r in ipairs(rows) do
-			getgenv()[r[3]] = on
+			getgenv()[r[3]] = on and (r[4] == nil or r[4] == mode)
 			_applyFlag(r[3])
 		end
 		_sync()
 	end
-	table.insert(GlobalConnections, SmartUI.bigBtn.MouseButton1Click:Connect(function()
-		SmartUI.setCycle(not getgenv().SmartCycleActive)
-	end))
+	-- Ganti fokus; kalau cycle sedang jalan, restart dengan set tugas mode baru
+	function SmartUI.setMode(mode)
+		if mode == getgenv().SmartCycleMode then return end
+		local running = getgenv().SmartCycleActive == true
+		if running then SmartUI.setCycle(false) end
+		getgenv().SmartCycleMode = mode
+		if running then SmartUI.setCycle(true) else _sync() end
+	end
+	-- Tombol mode X: kalau X sedang jalan -> stop; selain itu -> jalankan X (cycle lain otomatis berhenti)
+	local function tekan(mode)
+		if getgenv().SmartCycleActive and getgenv().SmartCycleMode == mode then
+			SmartUI.setCycle(false)
+		elseif getgenv().SmartCycleActive then
+			SmartUI.setMode(mode)
+		else
+			getgenv().SmartCycleMode = mode
+			SmartUI.setCycle(true)
+		end
+	end
+	table.insert(GlobalConnections, SmartUI.btnMining.MouseButton1Click:Connect(function() tekan("tambang") end))
+	table.insert(GlobalConnections, SmartUI.btnMasak.MouseButton1Click:Connect(function() tekan("sate") end))
 	_sync()
 
 	task.spawn(function()
 		while isRunValid() do
 			SmartUI.tBabi.Text = tostring(HarvestStats.Ngepet or 0)
-			SmartUI.tBesi.Text = tostring(SmartUI.lebur)
-			SmartUI.tBatu.Text = tostring(HarvestStats.Batu or 0)
+			local sate = getgenv().SmartCycleMode == "sate"
+			SmartUI.tBesi.Text = tostring(sate and SmartUI.sateMasak or SmartUI.lebur)
+			SmartUI.tBatu.Text = tostring(sate and SmartUI.terjual or (HarvestStats.Batu or 0))
 			if getgenv().SmartCycleActive then
 				local now = getgenv().PH_Repairing and "Memperbaiki alat"
 					or getgenv().PH_WijayaBusy and "Ke Pria Misterius"
@@ -4363,9 +4573,10 @@ getgenv().AutoMinumWijayaActive = false
 					or getgenv().PH_KandangBusy and "Mengurus kandang"
 					or SmartUI.supplyInfo
 					or getgenv().BatuFarmActive and "Mining batu"
+					or sate and "Menunggu kompor / lapak"
 					or "Menunggu tugas"
 				SmartUI.title.Text = now
-				SmartUI.status.Text = SmartUI.tungkuInfo
+				SmartUI.status.Text = (sate and SmartUI.sateInfo) or (not sate and SmartUI.tungkuInfo)
 					or string.format("Air Kembang: %d dibeli, %d diminum", SmartUI.wijayaBeli, SmartUI.wijayaMinum)
 			end
 			SmartUI.statusSub.Text = string.format(
@@ -4519,7 +4730,7 @@ task.spawn(function()
 			if b then seenAt[b] = nil end
 			return false
 		end
-		local now = tick()
+		local now = os.clock()
 		if not seenAt[b] then
 			seenAt[b] = now + 0.6 + math.random() * 0.8 -- waktu reaksi + tunggu animasi masuk
 			return false
@@ -4989,6 +5200,7 @@ task.spawn(function()
 					lv = data.level,
 					phase = data.phase,
 					cycle = data.cycle,
+					cycleMode = getgenv().SmartCycleMode,
 					babiCount = #data.babi,
 					batuCount = HarvestStats.Batu or 0,
 					leburCount = (SmartUI and SmartUI.lebur) or 0,
@@ -5001,6 +5213,9 @@ task.spawn(function()
 				if okParse and type(cmdData) == "table" and cmdData.cmd then
 					local c = cmdData.cmd
 					if c == "cycle_start" and SmartUI and SmartUI.setCycle then
+						if cmdData.mode == "sate" or cmdData.mode == "tambang" then
+							getgenv().SmartCycleMode = cmdData.mode
+						end
 						SmartUI.setCycle(true)
 					elseif c == "cycle_stop" and SmartUI and SmartUI.setCycle then
 						SmartUI.setCycle(false)
@@ -5053,6 +5268,8 @@ local SupplyConfig = {
 	SateKepiting = { min = 4, target = 12 },
 	KepitingSungai = { perMasak = 3 },
 	Dupa = { perMasak = 1 },
+	-- Mode "sate": farm bahan tanpa batas; sate yang TIDAK dijual (pakan palung babi)
+	SateMode = { sisaPakan = 10 },
 }
 getgenv().PH_SupplyBusy = false
 
@@ -5086,12 +5303,15 @@ task.spawn(function()
 
 	-- Farm bahan mentah yang sedang "dipinjam": { flag, item, target }
 	local borrowed = nil
+	local function sateMode()
+		return getgenv().SmartCycleMode == "sate"
+	end
 	local function release()
 		if borrowed then
 			setFarm(borrowed.flag, false)
 			borrowed = nil
 		end
-		setFarm("BatuFarmActive", true) -- default idle Smart Cycle
+		setFarm("BatuFarmActive", not sateMode()) -- idle: mode tambang = mining, mode sate = diam di kios
 	end
 	-- item yang farm-nya macet (malam / batas harian / node habis) -> istirahat dulu
 	local skipUntil = {}
@@ -5108,6 +5328,23 @@ task.spawn(function()
 	-- Kebutuhan bahan mentah, urut prioritas. Kembalikan { flag, item, target, label } atau nil.
 	local function kebutuhanMentah()
 		local C = SupplyConfig
+		if sateMode() then
+			if not getgenv().SateCycleBahan then return nil end
+			local kep, dupa = hitungTas("KepitingSungai"), hitungTas("Dupa")
+			-- Tanpa batas stok: farm terus selama cycle jalan (juga saat kompor penuh).
+			-- Bahan yang paling kurang (rasio 3 kepiting : 1 dupa) duluan; tiap putaran +3 porsi lalu cek kompor/kandang lagi.
+			-- Item yang farm-nya macet (skipUntil) dilewati supaya pindah ke bahan lain, bukan diam.
+			local function rehat(item) return skipUntil[item] and tick() < skipUntil[item] end
+			local kurangKep = rehat("KepitingSungai") and math.huge or (kep / C.KepitingSungai.perMasak)
+			local kurangDupa = rehat("Dupa") and math.huge or (dupa / C.Dupa.perMasak)
+			if kurangKep == math.huge and kurangDupa == math.huge then return nil end
+			if kurangKep <= kurangDupa then
+				return { flag = "KepitingFarmActive", item = "KepitingSungai", target = kep + 3 * C.KepitingSungai.perMasak,
+					label = string.format("Cari kepiting (punya %d)", kep) }
+			end
+			return { flag = "DupaFarmActive", item = "Dupa", target = dupa + 3 * C.Dupa.perMasak,
+				label = string.format("Cari dupa (punya %d)", dupa) }
+		end
 		local kayu = hitungTas("Kayu")
 		local papanKurang = hitungTas("PapanKayu") < C.PapanKayu.min
 		-- Kayu kurang (atau papan kurang dan kayu tak cukup untuk 1 batch papan)
@@ -5184,19 +5421,26 @@ task.spawn(function()
 	-- Masak Sate Kepiting kalau bahan siap
 	local nextMasak = 0
 	local function masakSate()
-		if not (RemoteCookStove and getgenv().AutoBabiActive) or tick() < nextMasak then return end
-		if hitungTas("SateKepiting") >= SupplyConfig.SateKepiting.min then return end
+		if not RemoteCookStove or tick() < nextMasak then return end
+		if sateMode() then
+			if not getgenv().SateCycleMasak then return end -- mode sate: masak terus selama bahan ada
+		elseif not getgenv().AutoBabiActive or hitungTas("SateKepiting") >= SupplyConfig.SateKepiting.min then
+			return
+		end
 		local bisa = math.min(math.floor(hitungTas("KepitingSungai") / 3), hitungTas("Dupa"))
 		if bisa < 1 then return end
 		nextMasak = tick() + 60 + math.random() * 30 -- masak 90 dtk; jangan bolak-balik ke kompor
+		-- antrean kompor penuh? jangan jalan ke kompor percuma
+		local okPoll, q = pcall(function() return RemoteCookQueuePoll and RemoteCookQueuePoll:InvokeServer() end)
+		local sisaSlot = (okPoll and type(q) == "table" and q.ok) and ((q.maxQueue or 3) - #(q.slots or {})) or 1
+		if sisaSlot < 1 then return end
 		getgenv().PH_SupplyBusy = true
 		SmartUI.supplyInfo = "Masak Sate Kepiting"
 		pcall(FarmHelpers.goToStove)
-		local okPoll, q = pcall(function() return RemoteCookQueuePoll and RemoteCookQueuePoll:InvokeServer() end)
-		local sisaSlot = (okPoll and type(q) == "table" and q.ok) and ((q.maxQueue or 3) - #(q.slots or {})) or 1
 		for _ = 1, math.min(bisa, sisaSlot) do
 			local ok, r = pcall(function() return RemoteCookStove:InvokeServer("SateKepiting") end)
 			if not (ok and type(r) == "table" and r.ok) then break end
+			SmartUI.sateMasak += 1
 			task.wait(0.8 + math.random() * 0.5)
 		end
 		getgenv().PH_SupplyBusy = false
@@ -5212,8 +5456,13 @@ task.spawn(function()
 			continue
 		end
 		-- jangan rebutan karakter dengan tugas lain
-		if getgenv().PH_Repairing or getgenv().PH_LeburBusy or getgenv().PH_WijayaBusy or getgenv().PH_KandangBusy then
+		if getgenv().PH_Repairing or getgenv().PH_LeburBusy or getgenv().PH_WijayaBusy or getgenv().PH_KandangBusy or getgenv().PH_BabiBusy then
 			continue
+		end
+
+		-- Mode sate: kompor jalan paralel, tetap masak walau sedang cari bahan (masakSate punya jeda 60-90 dtk)
+		if sateMode() and borrowed then
+			pcall(masakSate)
 		end
 
 		-- 1) Farm pinjaman: sudah capai target?
@@ -5237,9 +5486,13 @@ task.spawn(function()
 
 		-- 2) Masak sate (cepat, sekali mampir ke kompor)
 		pcall(masakSate)
+		if sateMode() then
+			SmartUI.sateInfo = string.format("Tas: %d sate, %d kepiting, %d dupa (sisa pakan %d)",
+				hitungTas("SateKepiting"), hitungTas("KepitingSungai"), hitungTas("Dupa"), SupplyConfig.SateMode.sisaPakan)
+		end
 
-		-- 3) Meja Tempa: cek tiap ~20 dtk saja (hemat remote)
-		if tick() - lastMeja > 30 then
+		-- 3) Meja Tempa: cek tiap ~20 dtk saja (hemat remote). Mode sate tidak butuh papan/batu asah.
+		if not sateMode() and tick() - lastMeja > 30 then
 			lastMeja = tick() + math.random() * 15 -- 30-45 dtk, tidak berirama tetap
 			local st = tempa({ aksi = "state" })
 			if st and st.ok and st.meja then
@@ -5273,7 +5526,7 @@ task.spawn(function()
 			borrow(need.flag, need.item, need.target, need.label)
 		else
 			SmartUI.supplyInfo = nil
-			if not getgenv().BatuFarmActive then setFarm("BatuFarmActive", true) end
+			if not sateMode() and not getgenv().BatuFarmActive then setFarm("BatuFarmActive", true) end
 		end
 	end
 end)
@@ -5783,7 +6036,6 @@ local function countIronInInventory()
 	_ta(LocalPlayer.Character)
 	return _sZ
 end
-local FarmHelpers = {}
 do
 	local _tf = 14
 	local function _tg()
@@ -5888,7 +6140,7 @@ local function startFarmWorker(_tD)
 		local _tG = false
 		local function _kandangYield()
 			return (_tD.name == "Batu" or getgenv().SmartCycleActive == true)
-				and (getgenv().PH_KandangBusy == true or getgenv().PH_LeburBusy == true or getgenv().PH_WijayaBusy == true or getgenv().PH_SupplyBusy == true)
+				and (getgenv().PH_KandangBusy == true or getgenv().PH_LeburBusy == true or getgenv().PH_WijayaBusy == true or getgenv().PH_SupplyBusy == true or getgenv().PH_BabiBusy == true)
 		end
 		local function _tH()
 			return isRunValid() and getgenv()[_tD.flag] and not getgenv().PH_Repairing and not _kandangYield()
@@ -6024,7 +6276,8 @@ local function startFarmWorker(_tD)
 					clearPhysicsLocks()
 					_tI()
 				end
-				setBodyVelocityZero(false)
+				-- noclip masih aktif selama farm nyala: lepas pengapung = tembus tanah (kepiting di dasar sungai)
+				setBodyVelocityZero(true)
 				task.wait(2.5)
 				continue
 			end
@@ -7046,7 +7299,7 @@ task.spawn(function()
 										_yJ = _yE.ObjectText:match("%((.-)%s*[xX]%d+%)")
 										local _yQ = _xr(_yE)
 										if _yQ and _yQ >= _xt(_yE) then
-											_wt[_yE] = tick() + 180
+											_wt[_yE] = tick() + 15
 											_yI = nil
 										end
 									end
@@ -7152,69 +7405,83 @@ task.spawn(function()
 		if _yZ.role == "pakan" then
 			local _zl, _zm, _zn = 0, 0, false
 			local function _zo()
-				-- total pakan sejenis di tas (attribute Count; nama tool tidak memuat xN)
-				if not _zd then return 0 end
-				local id = _zd:GetAttribute("ItemId")
-				local n = 0
-				for _, c in ipairs({ LocalPlayer:FindFirstChildOfClass("Backpack"), LocalPlayer.Character }) do
-					if c then
-						for _, t in ipairs(c:GetChildren()) do
-							if t:IsA("Tool") and (t.Name == _zd.Name or (id and t:GetAttribute("ItemId") == id)) then
-								n += tonumber(t:GetAttribute("Count")) or 1
-							end
-						end
-					end
-				end
-				return n
+				return (_zd and _zd.Parent) and (tonumber(_zd.Name:match("[xX](%d+)%s*$")) or 1) or 0
 			end
 			if _yZ.jenis == "babi" then
-				-- Palung: isi HANYA saat kosong, sampai full, lalu tinggal lama. Tanpa bolak-balik.
-				local _zp = _xt(_yZ.prompt) or 10
-				for _zs = 1, _zp + 5 do
+				local _zp = _xt(_yZ.prompt)
+				local _zq, _zr = 0, false
+				for _zs = 1, _zp + 8 do
 					if _zc() then
 						return false
 					end
 					if not _yZ.prompt.Parent or not _yZ.prompt.Enabled then
 						break
 					end
+					local _zt = _xr(_yZ.prompt) or 0
+					if _zt >= _zp then
+						_zn = true
+						break
+					end
 					if not _zd or not _zd.Parent then
 						_zd, _ze = _xV(_yZ)
 						if not _zd then
-							_wM(_yZ.jenis, "Pakan " .. tostring(_ze) .. " habis di tas")
+							_wM(_yZ.jenis, "Pakan " .. tostring(_ze) .. " habis")
 							break
 						end
 					end
 					if not _xd(_zd) then
 						break
 					end
-					_wM(_yZ.jenis, "Mengisi palung (" .. (_zm + 1) .. "/" .. _zp .. ")...")
+					_wM(_yZ.jenis, "Mengisi palung " .. tostring(_ze) .. " (" .. _zt .. "/" .. _zp .. ")")
 					local _zu = _zo()
 					local _zv = tick()
 					fireProximityPromptSafe(_yZ.prompt, _yZ.hold)
-					local _zw = false
+					local _zw, _zx = false, nil
 					while tick() - _zv < 2.0 do
 						task.wait(0.15)
-						if _zo() < _zu then
+						local _zy = _xr(_yZ.prompt) or 0
+						if _zy > _zt or _zo() < _zu then
 							_zw = true
 							break
 						end
+						if _xC >= _zv then
+							_zx = _xB
+							break
+						end
 					end
-					if not _zw then
-						break -- tas tidak berkurang: palung masih berisi / sudah full
+					if _zw then
+						_zm += 1
+						_zl, _zq = 0, 0
+						task.wait(1.0)
+					elseif _zx and _zx:find("sabar") then
+						_zq += 1
+						if _zq >= 5 then
+							break
+						end
+						task.wait(1.3)
+					elseif _zx and _zx:find("penuh") then
+						_zn = true
+						break
+					elseif _zx and (_zx:find("pakan lain") or _zx:find("beda")) then
+						_zr = true
+						break
+					else
+						_zl += 1
+						if _zl >= 3 then
+							break
+						end
+						task.wait(0.8)
 					end
-					_zm += 1
-					task.wait(0.7 + math.random() * 0.4)
 				end
-				if _zm > 0 then
-					_wM(_yZ.jenis, "Palung full (+" .. _zm .. " porsi), tinggal ~12 mnt")
-					_wt[_yZ.prompt] = tick() + 690 + math.random() * 60
-					_zj(_zm)
-				else
-					_wM(_yZ.jenis, "Palung masih ada isi, cek lagi ~10 mnt")
-					_wt[_yZ.prompt] = tick() + 570 + math.random() * 60
+				if _zr then
+					_wM(_yZ.jenis, "Palung berisi pakan lain - tunggu habis / samakan pakan")
+					_wt[_yZ.prompt] = tick() + 30
+					if _zm > 0 then
+						_zj(_zm)
+					end
+					task.wait(0.2)
+					return true
 				end
-				task.wait(0.2)
-				return true
 			else
 				local _zz = 5
 				for _zA = 1, _zz do
@@ -7266,16 +7533,7 @@ task.spawn(function()
 			if _zm > 0 then
 				_zj(_zm)
 			end
-			if _yZ.jenis == "babi" then
-				-- babi makan pelan (palung 10-20 porsi): cek lagi beberapa menit kemudian
-				if _zn or _zm > 0 then
-					_wM(_yZ.jenis, "Palung terisi (" .. _zm .. "x), cek lagi ~4 mnt")
-					_wt[_yZ.prompt] = tick() + 210 + math.random() * 60
-				else
-					_wM(_yZ.jenis, "Palung belum butuh pakan, cek lagi ~3 mnt")
-					_wt[_yZ.prompt] = tick() + 150 + math.random() * 60
-				end
-			elseif _zn then
+			if _zn then
 				_wM(_yZ.jenis, "Pakan penuh")
 				_wt[_yZ.prompt] = tick() + 20
 			elseif _zl >= 2 or _zm == 0 then
@@ -7717,7 +7975,7 @@ do
 		end
 		MasakStatusLabel.Text = "Menuju kompor..."
 		local _BH = smoothMoveTo(_BG + Vector3.new(0, 3, 0), function()
-			return not isRunValid() or not getgenv().AutoMasakActive or not getAliveHRPAndHum()
+			return not isRunValid() or not (getgenv().AutoMasakActive or getgenv().SmartCycleActive) or not getAliveHRPAndHum()
 		end)
 		task.wait(0.5)
 		return _BH
@@ -8022,6 +8280,7 @@ end);
 		local _Df = string.lower(tostring(_Dd or ""))
 		if string.find(_Df, "dewasa", 1, true) then
 			_BW.bad[_Da.id] = tick() + 120
+			_BW.tolak[_Da.id] = true -- tidak bisa dipanggang -> dijual ke Bandar
 			_Cf("Ditolak: " .. tostring(_Dd))
 		elseif string.find(_Df, "dekat", 1, true) or string.find(_Df, "jauh", 1, true) then
 			_BY, _BZ, _Ca, _Cb = nil, nil, nil, nil
@@ -8031,20 +8290,132 @@ end);
 			_Cf("Gagal memanggang: " .. tostring(_Dd or "tidak ada balasan") .. " (" .. _Cd .. "/4)")
 			if _Cd >= 4 then
 				_BW.bad[_Da.id] = tick() + 120
+				_BW.tolak[_Da.id] = true
 				_Cd = 0
 			end
 		end
 	end
+	_BW.tolak = {}
+	local function _cycleSibuk()
+		return getgenv().SmartCycleActive == true
+			and (getgenv().PH_KandangBusy or getgenv().PH_SupplyBusy or getgenv().PH_LeburBusy or getgenv().PH_WijayaBusy or getgenv().PH_Repairing)
+	end
 	task.spawn(function()
 		while isRunValid() do
 			task.wait(1.5)
-			if getgenv().AutoPanggangActive then
+			if getgenv().AutoPanggangActive and not _cycleSibuk() then
+				getgenv().PH_BabiBusy = true -- farm worker berhenti selama bawa babi ke pemanggang
 				local _Dg, _Dh = pcall(_CZ)
+				getgenv().PH_BabiBusy = false
 				if not _Dg then
 					warn("[Pasar Hutan] Auto Panggang error:", _Dh)
 					_Cf("Error: " .. tostring(_Dh))
 					task.wait(3)
 				end
+			end
+		end
+	end)
+
+	-- Jual babi POLOS yang tidak bisa dipanggang (< BeratMin kg / ditolak pemanggang) ke Bandar Babi.
+	-- Babi tipe khusus (varian/langka) dan babi terkunci TIDAK pernah dijual.
+	-- ponytail: argumen remote JualBabi belum terverifikasi; dicoba (idBabi), lalu prompt NPC Bandar.
+	--   Sukses = babi hilang dari tas. Balasan server dicetak ke console untuk penyesuaian.
+	getgenv().SateCycleJualBabi = getgenv().SateCycleJualBabi or false
+	local jualReg
+	pcall(function()
+		jualReg = require(ReplicatedStorage:WaitForChild("RemoteRegistry", 5))
+	end)
+	local bandar -- ProximityPrompt NPC Bandar (cache)
+	local function bandarPos()
+		if not (bandar and bandar.Parent) then
+			bandar = nil
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if d:IsA("ProximityPrompt") then
+					local t = string.lower(d.ObjectText .. " " .. d.ActionText .. " " .. (d.Parent and d.Parent.Name or "") .. " "
+						.. (d.Parent and d.Parent.Parent and d.Parent.Parent.Name or ""))
+					if string.find(t, "bandar", 1, true) then
+						bandar = d
+						break
+					end
+				end
+			end
+		end
+		local par = bandar and bandar.Parent
+		if not par then return nil end
+		if par:IsA("Attachment") then return par.WorldPosition end
+		if par:IsA("BasePart") then return par.Position end
+		if par:IsA("Model") then return par:GetPivot().Position end
+		return nil
+	end
+	local function masihDiTas(tool)
+		local p = tool.Parent
+		return p ~= nil and (p == LocalPlayer.Character or p == LocalPlayer:FindFirstChildOfClass("Backpack"))
+	end
+	local jualGagal = {}
+	local function jualSatu(b)
+		local pos = bandarPos()
+		if not pos then
+			_Cf("NPC Bandar Babi tidak ditemukan")
+			return false
+		end
+		local hrp = getAliveHRPAndHum()
+		if hrp and (hrp.Position - pos).Magnitude > 8 then
+			_Cf("Bawa babi " .. b.kg .. " kg ke Bandar Babi...")
+			smoothMoveTo(pos + Vector3.new(0, 3, 4), function()
+				return not isRunValid() or not getgenv().SateCycleJualBabi or not getAliveHRPAndHum()
+			end)
+			task.wait(0.4)
+		end
+		if not _CP(b) then return false end
+		task.wait(0.3)
+		local balasan
+		local r = jualReg and jualReg.get and select(2, pcall(jualReg.get, "JualBabi"))
+		if r and typeof(r) == "Instance" and r:IsA("RemoteFunction") then
+			local ok, res = pcall(function() return r:InvokeServer(b.id) end)
+			balasan = ok and res or nil
+			task.wait(0.6)
+		end
+		if masihDiTas(b.tool) and bandar then
+			pcall(function() bandar:InputHoldBegin() end)
+			task.wait((bandar.HoldDuration or 0.5) + 0.2)
+			pcall(function() bandar:InputHoldEnd() end)
+			task.wait(1)
+		end
+		if masihDiTas(b.tool) then
+			local alasan = type(balasan) == "table" and tostring(balasan.sebab or balasan.reason or balasan.pesan or balasan.err or "?") or tostring(balasan)
+			warn("[Pasar Hutan] Jual babi " .. b.kg .. " kg gagal. Balasan JualBabi:", alasan)
+			_Cf("Jual babi gagal (" .. alasan .. ")")
+			return false
+		end
+		SmartUI.babiJual = (SmartUI.babiJual or 0) + 1
+		_Cf("Terjual ke Bandar: babi " .. b.kg .. " kg")
+		task.wait(1.5) -- server menolak "terlalu_cepat" kalau beruntun
+		return true
+	end
+	task.spawn(function()
+		while isRunValid() do
+			task.wait(4)
+			if not getgenv().SateCycleJualBabi or _cycleSibuk() or getgenv().PH_BabiBusy or getgenv().PH_Repairing then
+				continue
+			end
+			local target
+			for _, b in ipairs(_BW.scan()) do
+				local gagal = jualGagal[b.id]
+				if not b.khusus and not b.locked and not (gagal and tick() < gagal)
+					and (b.kg < _BW.minKg or _BW.tolak[b.id]) then
+					target = b
+					break
+				end
+			end
+			if target then
+				getgenv().PH_BabiBusy = true
+				setBodyVelocityZero(true)
+				local ok, sukses = pcall(jualSatu, target)
+				if not (ok and sukses) then
+					jualGagal[target.id] = tick() + 300 -- jangan bolak-balik ke Bandar untuk babi yang sama
+				end
+				setBodyVelocityZero(false)
+				getgenv().PH_BabiBusy = false
 			end
 		end
 	end)
@@ -8249,10 +8620,19 @@ task.spawn(function()
 	if PersistenceManager.state then
 		task.wait(3)
 	end
+	-- Smart Cycle mode sate: lapak hanya untuk Sate Kepiting, sisakan stok pakan babi
+	local function _sateJual()
+		return getgenv().SmartCycleActive == true and getgenv().SmartCycleMode == "sate" and getgenv().SateCycleJual == true
+			and not getgenv().AutoKelolaLapakActive
+	end
+	local function _lapakOn()
+		return getgenv().AutoKelolaLapakActive or _sateJual()
+	end
 	local function _Ed()
-		if not getgenv().AutoKelolaLapakActive then
+		if not _lapakOn() then
 			return
 		end
+		local _sj = _sateJual()
 		if not getAliveHRPAndHum() then
 			LapakStatusLabel.Text = "Menunggu karakter respawn..."
 			return
@@ -8282,12 +8662,29 @@ task.spawn(function()
 			or "Siang"
 		local _Eh = LapakManager.scanInventory()
 		local _Ei = {}
-		for _Ej, _Ek in ipairs(LapakManager.pilih[_Eg] or {}) do
+		if _sj then
+			-- ponytail: server "taruh" bisa memindah 1 tumpukan penuh; cadangan pakan dijaga sebelum taruh, bukan per biji.
+			local _sk = _Eh.SateKepiting
+			local _bg = _Eh.BabiGuling
+			local _jual = _sk and (_sk.count - SupplyConfig.SateMode.sisaPakan) or 0
+			_Eh = {}
+			-- pembeli cuma muncul di fase yang cocok; di luar itu jangan taruh (hindari tarik-taruh bolak-balik)
+			if _jual > 0 and LapakManager.cocok("SateKepiting", _Eg) then
+				_Eh.SateKepiting = { id = "SateKepiting", count = _jual, harga = _sk.harga }
+				table.insert(_Ei, "SateKepiting")
+			end
+			-- Babi Guling hasil panggang (600 koin/porsi) ikut dijual, semua
+			if _bg and _bg.count > 0 and LapakManager.cocok("BabiGuling", _Eg) then
+				_Eh.BabiGuling = { id = "BabiGuling", count = _bg.count, harga = _bg.harga }
+				table.insert(_Ei, "BabiGuling")
+			end
+		end
+		for _Ej, _Ek in ipairs(_sj and {} or LapakManager.pilih[_Eg] or {}) do
 			if _Eh[_Ek] and _Eh[_Ek].count > 0 then
 				table.insert(_Ei, _Ek)
 			end
 		end
-		if #_Ei == 0 then
+		if #_Ei == 0 and not _sj then
 			local _El = (_Eg == "Malam") and "Siang" or "Malam"
 			for _Em, _En in ipairs(LapakManager.pilih[_El] or {}) do
 				if _Eh[_En] and _Eh[_En].count > 0 then
@@ -8295,7 +8692,7 @@ task.spawn(function()
 				end
 			end
 		end
-		if #_Ei == 0 and #(LapakManager.pilih.Siang or {}) == 0 and #(LapakManager.pilih.Malam or {}) == 0 then
+		if #_Ei == 0 and not _sj and #(LapakManager.pilih.Siang or {}) == 0 and #(LapakManager.pilih.Malam or {}) == 0 then
 			local _Eo = {}
 			for _Ep, _Eq in pairs(_Eh) do
 				if _Eq.count > 0 then
@@ -8330,7 +8727,7 @@ task.spawn(function()
 		local _EC = {}
 		local _ED = {}
 		for _EE, _EF in ipairs(_Ef) do
-			if not isRunValid() or not getgenv().AutoKelolaLapakActive then
+			if not isRunValid() or not _lapakOn() then
 				break
 			end
 			local _EG = _EF:GetAttribute("Item")
@@ -8377,7 +8774,7 @@ task.spawn(function()
 			_Eh = LapakManager.scanInventory()
 		end
 		for _EO, _EP in ipairs(_ED) do
-			if not isRunValid() or not getgenv().AutoKelolaLapakActive then
+			if not isRunValid() or not _lapakOn() then
 				break
 			end
 			LapakStatusLabel.Text =
@@ -8394,7 +8791,7 @@ task.spawn(function()
 		if #_Ei > 0 and #_EC > 0 then
 			local _ET = 1
 			for _EU, _EV in ipairs(_EC) do
-				if not isRunValid() or not getgenv().AutoKelolaLapakActive then
+				if not isRunValid() or not _lapakOn() then
 					break
 				end
 				local _EW = nil
@@ -8415,6 +8812,9 @@ task.spawn(function()
 					local _Fb = _Fa.n or 1
 					_Eh[_EW].count = math.max(0, _Eh[_EW].count - _Fb)
 					_EB += 1
+					if _sj then
+						SmartUI.terjual += _Fb
+					end
 				end
 				task.wait(0.45)
 			end
@@ -8428,7 +8828,7 @@ task.spawn(function()
 	end
 	while isRunValid() do
 		task.wait(LapakConfig.interval)
-		if getgenv().AutoKelolaLapakActive then
+		if _lapakOn() then
 			local _Fc, _Fd = pcall(_Ed)
 			if not _Fc then
 				warn("[Pasar Hutan] Error loop lapak (lanjut otomatis):", _Fd)
@@ -8529,7 +8929,7 @@ setFarmToggleUI("JamurFarmActive", JamurUI.toggle, JamurUI.status, "Jamur")
 setFarmToggleUI("PohonFarmActive", PohonToggleBtn, PohonStatusLabel, "Pohon")
 setFarmToggleUI("BatuFarmActive", BatuToggleBtn, BatuStatusLabel, "Batu")
 print(
-	"[Pasar Hutan v6.5.20] Berhasil dimuat! Auto Panggang Babi (pilih kg), Auto Klaim Babi Ngepet 100%, Gosok Induk switch, Auto Masak 10 menu, Mode Biji Besi, Alat Terbaik & Auto Perbaiki aktif."
+	"[Pasar Hutan v6.5.21] Berhasil dimuat! Smart Cycle 2 mode (Tambang / Sate Kepiting), Auto Panggang Babi (pilih kg), Auto Klaim Babi Ngepet 100%, Gosok Induk switch, Auto Masak 10 menu, Mode Biji Besi, Alat Terbaik & Auto Perbaiki aktif."
 )
 
 

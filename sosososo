@@ -2879,18 +2879,21 @@ do
 					or string.find(_nV.Name, "Babi Ngepet", 1, true) ~= nil
 				)
 		end
-		-- Babi tipe khusus (varian/langka) = DISIMPAN: tidak dipanggang, tidak dijual.
-		-- ponytail: deteksi dari atribut kelangkaan + kata kunci nama; kalau game pakai atribut lain, tambah di sini.
+		-- Babi tipe khusus = DISIMPAN: tidak dipanggang, tidak dijual.
+		-- Atribut tool `babiKelangkaan`: biasa < langka < mitos < sultan < siluman, + varian (penyihir, daun, ...).
+		-- "langka" harganya sama dengan biasa (kaliVar 1), jadi ikut diproses kecuali SimpanBabiLangka dinyalakan.
+		getgenv().SimpanBabiLangka = getgenv().SimpanBabiLangka == true
 		local VARIAN = { "boy", "detektif", "labu", "pita", "penyihir", "daun", "raja", "ceplok", "bunga", "jerami", "imut",
-			"mitos", "sultan", "siluman", "langka" }
+			"mitos", "sultan", "siluman" }
 		_nS.khusus = function(t)
-			for _, a in ipairs({ "babiKelangkaan", "Kelangkaan", "kelangkaan", "babiVarian", "Varian", "babiTipe", "Tipe", "Rarity" }) do
-				local v = t:GetAttribute(a)
-				if v ~= nil and v ~= "" and string.lower(tostring(v)) ~= "biasa" then
-					return true
-				end
+			local kel = string.lower(tostring(t:GetAttribute("babiKelangkaan") or "biasa"))
+			if kel == "langka" then
+				return getgenv().SimpanBabiLangka
 			end
-			local nm = string.lower(t.Name .. " " .. tostring(t:GetAttribute("babiNama") or ""))
+			if kel ~= "biasa" and kel ~= "" then
+				return true
+			end
+			local nm = string.lower(t.Name .. " " .. tostring(t:GetAttribute("babiVarian") or ""))
 			for _, k in ipairs(VARIAN) do
 				if string.find(nm, k, 1, true) then
 					return true
@@ -8231,10 +8234,14 @@ end);
 		end)
 		for _CY = 1, 20 do
 			task.wait(0.2)
-			if _Cq() then
+			if _Cq() or not _CW.tool.Parent then
 				return true, _CF(_CX)
 			end
 		end
+		-- gagal: lepas babi dari tangan, kalau dibawa jalan babi terjatuh di map
+		pcall(function()
+			select(2, getAliveHRPAndHum()):UnequipTools()
+		end)
 		return false, _CF(_CX)
 	end
 	local function _CZ()
@@ -8316,80 +8323,82 @@ end);
 		end
 	end)
 
-	-- Jual babi POLOS yang tidak bisa dipanggang (< BeratMin kg / ditolak pemanggang) ke Bandar Babi.
-	-- Babi tipe khusus (varian/langka) dan babi terkunci TIDAK pernah dijual.
-	-- ponytail: argumen remote JualBabi belum terverifikasi; dicoba (idBabi), lalu prompt NPC Bandar.
-	--   Sukses = babi hilang dari tas. Balasan server dicetak ke console untuk penyesuaian.
+	-- Jual babi yang tidak bisa dipanggang (< BeratMin kg / ditolak pemanggang) ke Bandar Babi, seperti pemain:
+	-- jalan ke Bandar -> tekan "Bicara" -> buka menu Jual Babi -> jual. Babi TIDAK dipegang (pegang+jalan = babi
+	-- terlepas di map). Babi khusus & terkunci tidak pernah dijual.
+	-- ponytail: dialog & ConfirmDialog game menunggu klik mouse, jadi langkah terakhir mengirim permintaan yang sama
+	--   dengan tombol "Jual semua" di menu (BabiBandar "jualBanyak" {ids}); server menolak kalau jauh dari NPC.
 	getgenv().SateCycleJualBabi = getgenv().SateCycleJualBabi or false
 	local jualReg
 	pcall(function()
 		jualReg = require(ReplicatedStorage:WaitForChild("RemoteRegistry", 5))
 	end)
-	local bandar -- ProximityPrompt NPC Bandar (cache)
-	local function bandarPos()
-		if not (bandar and bandar.Parent) then
-			bandar = nil
-			for _, d in ipairs(workspace:GetDescendants()) do
-				if d:IsA("ProximityPrompt") then
-					local t = string.lower(d.ObjectText .. " " .. d.ActionText .. " " .. (d.Parent and d.Parent.Name or "") .. " "
-						.. (d.Parent and d.Parent.Parent and d.Parent.Parent.Name or ""))
-					if string.find(t, "bandar", 1, true) then
-						bandar = d
-						break
-					end
-				end
+	local function bandarPrompt()
+		local npc = workspace:FindFirstChild("NPC") and workspace.NPC:FindFirstChild("BandarBabi")
+		return npc and npc:FindFirstChildWhichIsA("ProximityPrompt", true), npc
+	end
+	local function tutupMenuJual()
+		local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		local g = pg and pg:FindFirstChild("JualBabiGui")
+		local close = g and g:FindFirstChild("CloseButton", true)
+		for _, c in ipairs(close and getconnections and getconnections(close.MouseButton1Click) or {}) do
+			if type(c.Function) == "function" then
+				pcall(c.Function)
 			end
 		end
-		local par = bandar and bandar.Parent
-		if not par then return nil end
-		if par:IsA("Attachment") then return par.WorldPosition end
-		if par:IsA("BasePart") then return par.Position end
-		if par:IsA("Model") then return par:GetPivot().Position end
-		return nil
-	end
-	local function masihDiTas(tool)
-		local p = tool.Parent
-		return p ~= nil and (p == LocalPlayer.Character or p == LocalPlayer:FindFirstChildOfClass("Backpack"))
 	end
 	local jualGagal = {}
-	local function jualSatu(b)
-		local pos = bandarPos()
-		if not pos then
+	local function jualKeBandar(targets)
+		local prompt, npc = bandarPrompt()
+		if not (prompt and npc) then
 			_Cf("NPC Bandar Babi tidak ditemukan")
 			return false
 		end
+		local hum = select(2, getAliveHRPAndHum())
+		if hum then
+			pcall(function() hum:UnequipTools() end) -- jangan bawa babi di tangan
+		end
+		local pos = npc:GetPivot().Position
 		local hrp = getAliveHRPAndHum()
-		if hrp and (hrp.Position - pos).Magnitude > 8 then
-			_Cf("Bawa babi " .. b.kg .. " kg ke Bandar Babi...")
-			smoothMoveTo(pos + Vector3.new(0, 3, 4), function()
+		if hrp and (hrp.Position - pos).Magnitude > 6 then
+			_Cf("Jalan ke Bandar Babi (" .. #targets .. " babi)...")
+			smoothMoveTo(pos + (hrp.Position - pos) * Vector3.new(1, 0, 1).Unit * 4 + Vector3.new(0, 2, 0), function()
 				return not isRunValid() or not getgenv().SateCycleJualBabi or not getAliveHRPAndHum()
 			end)
-			task.wait(0.4)
+			task.wait(0.4 + math.random() * 0.3)
 		end
-		if not _CP(b) then return false end
-		task.wait(0.3)
-		local balasan
-		local r = jualReg and jualReg.get and select(2, pcall(jualReg.get, "JualBabi"))
-		if r and typeof(r) == "Instance" and r:IsA("RemoteFunction") then
-			local ok, res = pcall(function() return r:InvokeServer(b.id) end)
-			balasan = ok and res or nil
-			task.wait(0.6)
+		-- interaksi seperti pemain: "Bicara" -> pilih Jual babi (membuka menu)
+		pcall(function() prompt:InputHoldBegin() end)
+		task.wait((prompt.HoldDuration or 0.2) + 0.15)
+		pcall(function() prompt:InputHoldEnd() end)
+		task.wait(0.8 + math.random() * 0.4)
+		pcall(function() ReplicatedStorage:WaitForChild("BukaJualBabi", 2):Fire() end)
+		task.wait(0.8 + math.random() * 0.5)
+		local r = jualReg and select(2, pcall(jualReg.get, "BabiBandar"))
+		if not (r and typeof(r) == "Instance" and r:IsA("RemoteFunction")) then
+			_Cf("Menu jual babi tidak tersedia")
+			tutupMenuJual()
+			return false
 		end
-		if masihDiTas(b.tool) and bandar then
-			pcall(function() bandar:InputHoldBegin() end)
-			task.wait((bandar.HoldDuration or 0.5) + 0.2)
-			pcall(function() bandar:InputHoldEnd() end)
-			task.wait(1)
+		local ids = {}
+		for i, b in ipairs(targets) do
+			ids[i] = b.id
 		end
-		if masihDiTas(b.tool) then
-			local alasan = type(balasan) == "table" and tostring(balasan.sebab or balasan.reason or balasan.pesan or balasan.err or "?") or tostring(balasan)
-			warn("[Pasar Hutan] Jual babi " .. b.kg .. " kg gagal. Balasan JualBabi:", alasan)
+		local ok, res = pcall(function() return r:InvokeServer("jualBanyak", { ids = ids }) end)
+		if ok and type(res) == "table" and res.sebab == "terlalu_cepat" then
+			task.wait(2)
+			ok, res = pcall(function() return r:InvokeServer("jualBanyak", { ids = ids }) end)
+		end
+		task.wait(0.6)
+		tutupMenuJual()
+		if not (ok and type(res) == "table" and res.ok) then
+			local alasan = type(res) == "table" and tostring(res.sebab or res.pesan or "?") or tostring(res)
+			warn("[Pasar Hutan] Jual babi ke Bandar gagal:", alasan)
 			_Cf("Jual babi gagal (" .. alasan .. ")")
 			return false
 		end
-		SmartUI.babiJual = (SmartUI.babiJual or 0) + 1
-		_Cf("Terjual ke Bandar: babi " .. b.kg .. " kg")
-		task.wait(1.5) -- server menolak "terlalu_cepat" kalau beruntun
+		SmartUI.babiJual = (SmartUI.babiJual or 0) + #ids
+		_Cf("Terjual ke Bandar: " .. #ids .. " babi")
 		return true
 	end
 	task.spawn(function()
@@ -8398,21 +8407,23 @@ end);
 			if not getgenv().SateCycleJualBabi or _cycleSibuk() or getgenv().PH_BabiBusy or getgenv().PH_Repairing then
 				continue
 			end
-			local target
+			-- kumpulkan semua babi yang perlu dijual, sekali jalan ke Bandar
+			local targets = {}
 			for _, b in ipairs(_BW.scan()) do
 				local gagal = jualGagal[b.id]
 				if not b.khusus and not b.locked and not (gagal and tick() < gagal)
 					and (b.kg < _BW.minKg or _BW.tolak[b.id]) then
-					target = b
-					break
+					targets[#targets + 1] = b
 				end
 			end
-			if target then
+			if #targets > 0 then
 				getgenv().PH_BabiBusy = true
 				setBodyVelocityZero(true)
-				local ok, sukses = pcall(jualSatu, target)
+				local ok, sukses = pcall(jualKeBandar, targets)
 				if not (ok and sukses) then
-					jualGagal[target.id] = tick() + 300 -- jangan bolak-balik ke Bandar untuk babi yang sama
+					for _, b in ipairs(targets) do
+						jualGagal[b.id] = tick() + 300 -- jangan bolak-balik ke Bandar untuk babi yang sama
+					end
 				end
 				setBodyVelocityZero(false)
 				getgenv().PH_BabiBusy = false
